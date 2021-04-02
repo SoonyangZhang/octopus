@@ -5,7 +5,6 @@
 #include "octopus/octopus_base.h"
 #include "base/cmdline.h"
 #include "tcp/tcp_server.h"
-#include "base/epoll_api.h"
 using namespace basic;
 using namespace std;
 static volatile bool g_running=true;
@@ -50,9 +49,7 @@ int main(int argc, char *argv[]){
         sockaddr_storage saddr_to=socket_addr_dst.generic_address();
         proxy_saddr_vec.push_back(std::make_pair(saddr_from,saddr_to));
     }
-    uint64_t uuid=0;
-    std::unique_ptr<OctopusCallerSocketFactory> socket_factory(new OctopusCallerSocketFactory(uuid,
-    						proxy_saddr_vec));
+    std::unique_ptr<OctopusCallerSocketFactory> socket_factory(new OctopusCallerSocketFactory(proxy_saddr_vec));
     TcpServer server(std::move(socket_factory));
     PhysicalSocketServer *socket_server=server.socket_server();
     CHECK(socket_server);

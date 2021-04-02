@@ -5,7 +5,6 @@
 #include "octopus/octopus_base.h"
 #include "base/cmdline.h"
 #include "tcp/tcp_server.h"
-#include "base/epoll_api.h"
 static volatile bool g_running=true;
 void signal_exit_handler(int sig)
 {

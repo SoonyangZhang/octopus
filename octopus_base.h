@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <string>
+#include <signal.h>
 #include <atomic>
 #include <memory>
 #include <deque>
@@ -18,18 +19,46 @@
 #include "tpproxy/windowed_filter.h"
 #include "tpproxy/interval_budget.h"
 #include "octopus/octopus_error_codes.h"
+#define octopus_signal_helper(n)     SIG##n
+#define octopus_signal_value(n)      octopus_signal_helper(n)
+#define octopus_str_value_helper(n)   #n
+#define octopus_str_value(n)          octopus_str_value_helper(n)
+#define OCTOPUS_SHUTDOWN_SIGNAL      QUIT
+#define OCTOPUS_TERMINATE_SIGNAL     TERM
+#define OCTOPUS_PIPE_SIGNAL      PIPE
+typedef struct {
+    int     signo;
+    char   *signame;
+    char   *name;
+    void  (*handler)(int signo, siginfo_t *siginfo, void *ucontext);
+}octopus_signal_t;
 namespace basic{
 bool octopus_enable_epollet();
+struct OctopusSessionKey{
+	OctopusSessionKey():OctopusSessionKey(0,0,0,0){}
+	OctopusSessionKey(uint32_t from,uint32_t to,
+                   uint16_t src_port,uint16_t dst_port):
+                	   from(from),to(to),
+    src_port(src_port),dst_port(dst_port){}
+    uint32_t from=0;
+    uint32_t to=0;
+    uint16_t src_port=0;
+    uint16_t dst_port=0;
+	bool operator < (const OctopusSessionKey &o) const
+	{
+		return from < o.from||to<o.to||
+		src_port<o.src_port||dst_port<o.dst_port;
+	}
+};
 class OctopusDispatcher;
 class OctopusDispatcherManager{
 public:
-	bool Register(uint64_t uuid,uint64_t ssid,OctopusDispatcher* dispatcher);
-	bool UnRegister(uint64_t uuid,uint64_t ssid);
-	OctopusDispatcher* Find(uint64_t uuid,uint64_t ssid);
-    size_t RowSize() const;
-    size_t ColumSize(uint64_t uuid) const;
+	bool Register(OctopusSessionKey &key,OctopusDispatcher* dispatcher);
+	bool UnRegister(OctopusSessionKey &key);
+	OctopusDispatcher* Find(OctopusSessionKey &key);
+    size_t Size() const {return tables_.size();}
 private:
-	std::map<uint64_t,std::map<uint64_t,OctopusDispatcher*>> tables_;
+	std::map<OctopusSessionKey,OctopusDispatcher*> tables_;
 };
 class OctopusBase{
 public:
@@ -59,10 +88,9 @@ protected:
 class OctopusHand:public OctopusBase,public EpollCallbackInterface{
 public:
 	OctopusHand(BaseContext *context,int fd,OctopusHandRole role,
-			 OctopusDispatcherManager *manager,OctopusDispatcher *dispatcher);
+			 OctopusDispatcherManager &manager,OctopusDispatcher *dispatcher);
 	~OctopusHand();
-	void WriteMeta(uint64_t uuid,uint64_t ssid,const struct sockaddr_storage &src_saddr,
-			const struct sockaddr_storage &dst_saddr,bool sp_flag=true);
+	void WriteMeta(OctopusSessionKey &uuid,bool sp_flag=true);
 	bool AsynConnect(const struct sockaddr * addr,socklen_t addrlen);
 	void SignalFrom(OctopusDispatcher* dispatcher,OctopusSignalCode code);
 	void Sink(const char *pv,int sz);
@@ -84,7 +112,7 @@ private:
 	void SendMetaAck(OctopusSignalCode code);
     void DeleteSelf();
 	OctopusHandRole role_;
-	OctopusDispatcherManager *manager_=nullptr;
+	OctopusDispatcherManager &manager_;
 	OctopusDispatcher *dispatcher_=nullptr;
 	std::unique_ptr<BaseAlarm> out_bw_alarm_;
 	uint8_t msg_flag_=0;
@@ -95,18 +123,14 @@ private:
 class OctopusDispatcher:public OctopusBase,public EpollCallbackInterface,
 public BaseContext::ExitVisitor{
 public:
-	OctopusDispatcher(BaseContext *context,int fd,uint64_t uuid,uint64_t ssid,
-			OctopusDispatcherRole role,OctopusDispatcherManager *manager);
+	OctopusDispatcher(BaseContext *context,int fd,OctopusSessionKey &uuid,
+			OctopusDispatcherRole role,OctopusDispatcherManager &manager);
 	virtual ~OctopusDispatcher();
 	void SignalFrom(OctopusHand*hand,OctopusSignalCode code);
 	//client side logic
-	bool CreateSingleConnection(const sockaddr_storage &origin_src_saddr,
-			const sockaddr_storage &origin_dst_saddr,
-			const sockaddr_storage &proxy_src_saddr,
+	bool CreateSingleConnection(const sockaddr_storage &proxy_src_saddr,
 			const sockaddr_storage &proxy_dst_saddr);
-	bool CreateMutipleConnections(const sockaddr_storage &origin_src_saddr,
-			const sockaddr_storage &origin_dst_saddr,
-			const std::vector<std::pair<sockaddr_storage,sockaddr_storage>>& proxy_saddrs
+	bool CreateMutipleConnections(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>>& proxy_saddrs
 			);
 	//server side logic
 	bool AsynConnect(const struct sockaddr *addr,socklen_t addrlen);
@@ -128,10 +152,9 @@ public:
 protected:
     void ConnClose(OctopusSignalCode code);
     void DeleteSelf();
-    uint64_t uuid_;
-    uint64_t ssid_;
+    OctopusSessionKey uuid_;
 	OctopusDispatcherRole role_;
-	OctopusDispatcherManager *manager_=nullptr;
+	OctopusDispatcherManager &manager_;
 	std::unique_ptr<BaseAlarm> socket_alarm_;
 	QuicTime last_alarm_time_=QuicTime::Zero();
     std::set<OctopusHand*> wait_hands_;
@@ -140,33 +163,32 @@ protected:
 };
 class OctopusCallerBackend:public Backend{
 public:
-	OctopusCallerBackend(uint64_t uuid,
-			const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec);
+	OctopusCallerBackend(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec);
 	void CreateEndpoint(BaseContext *context,int fd) override;
 private:
-	uint64_t uuid_=0;
-	uint64_t ssid_=0;
 	const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec_;
 };
 class OctopusCallerSocketFactory:public SocketServerFactory{
 public:
-	OctopusCallerSocketFactory(uint64_t uuid,
-			const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec);
+	OctopusCallerSocketFactory(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec);
 	PhysicalSocketServer* CreateSocketServer(BaseContext *context) override;
 private:
-	uint64_t uuid_=0;
 	std::vector<std::pair<sockaddr_storage,sockaddr_storage>> proxy_saddr_vec_;
 };
 class OctopusCalleeBackend:public Backend{
 public:
-	OctopusCalleeBackend(){}
-	void CreateEndpoint(BaseContext *context,int fd) override;
+    OctopusCalleeBackend(){}
+    void CreateEndpoint(BaseContext *context,int fd) override;
 private:
-	OctopusDispatcherManager manager_;
+    OctopusDispatcherManager manager_;
 };
 class OctopusCalleeSocketFactory:public SocketServerFactory{
 public:
-	OctopusCalleeSocketFactory(){}
+    OctopusCalleeSocketFactory(){}
     PhysicalSocketServer* CreateSocketServer(BaseContext *context) override;
 };
+int octopus_write_pid(const char *pidfile);
+int octopus_read_pid(const char *pidfile);
+int octopus_remove_pid(const char *pidfile);
+void octopus_daemonise(void);
 }

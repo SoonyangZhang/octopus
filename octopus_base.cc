@@ -8,7 +8,8 @@
 #include <sys/socket.h>
 #include <linux/sockios.h>//SIOCOUTQ
 #include <memory.h>
-
+#include <assert.h>
+#include <sys/file.h>
 #include "octopus/octopus_base.h"
 #include "tcp/tcp_info.h"
 #include "base/byte_codec.h"
@@ -23,10 +24,12 @@ const QuicTime::Delta kBandwidthInterval=QuicTime::Delta::FromMilliseconds(5);
 const QuicTime::Delta kSocketRWInterval=QuicTime::Delta::FromMilliseconds(5);
 const QuicTime::Delta kMinRoundTripTime=QuicTime::Delta::FromMilliseconds(5);
 }
-#define octopus_nonblocking(s)  fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK)
 static bool OctopusEpollETFlag=false;
+#define octopus_nonblocking(s)  fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK)
+template<typename T>
+T& create_null_ref() { return *static_cast<T*>(nullptr);}
 bool octopus_enable_epollet(){
-	OctopusEpollETFlag=true;
+OctopusEpollETFlag=true;
 }
 static std::string OctopusHandRoleToString(OctopusHandRole rule) {
   switch (rule) {
@@ -101,59 +104,31 @@ inline int read_pending(int fd){
 	return pending;
 }
 
-bool OctopusDispatcherManager::Register(uint64_t uuid,uint64_t ssid,OctopusDispatcher*dispatcher){
+bool OctopusDispatcherManager::Register(OctopusSessionKey & uuid,OctopusDispatcher*dispatcher){
         bool ret=false;
-        auto first_it=tables_.find(uuid);
-        if (first_it!=tables_.end()){
-            auto second_it=first_it->second.find(ssid);
-            if (second_it==first_it->second.end()){
-                first_it->second.insert(std::make_pair(ssid,dispatcher));
-                ret=true;
-            }
-        }else{
-            std::map<uint64_t,OctopusDispatcher*> value;
-            value.insert(std::make_pair(ssid,dispatcher));
-            tables_.insert(std::make_pair(uuid,value));
-            ret=true;
+        auto it=tables_.find(uuid);
+        if(it==tables_.end()){
+        	tables_.insert(std::make_pair(uuid,dispatcher));
+        	ret=true;
         }
         return ret;
 }
-bool OctopusDispatcherManager::UnRegister(uint64_t uuid,uint64_t ssid){
+bool OctopusDispatcherManager::UnRegister(OctopusSessionKey & uuid){
     bool ret=false;
-    auto first_it=tables_.find(uuid);
-    if(first_it!=tables_.end()){
-        auto second_it=first_it->second.find(ssid);
-        if (second_it!=first_it->second.end()){
-            first_it->second.erase(second_it);
-            if (first_it->second.size()==0){
-                tables_.erase(first_it);
-            }
-            ret=true;
-        }
+    auto it=tables_.find(uuid);
+    if(it!=tables_.end()){
+    	tables_.erase(it);
+    	ret=true;
     }
     return ret;
 }
-OctopusDispatcher *OctopusDispatcherManager::Find(uint64_t uuid,uint64_t ssid){
+OctopusDispatcher *OctopusDispatcherManager::Find(OctopusSessionKey &uuid){
 	OctopusDispatcher *dispatcher=nullptr;
-    auto first_it=tables_.find(uuid);
-    if(first_it!=tables_.end()){
-        auto second_it=first_it->second.find(ssid);
-        if (second_it!=first_it->second.end()){
-            dispatcher=second_it->second;
-        }
-    }
+	auto it=tables_.find(uuid);
+	if(it!=tables_.end()){
+		dispatcher=it->second;
+	}
     return dispatcher;
-}
-size_t OctopusDispatcherManager::RowSize() const{
-    return tables_.size();
-}
-size_t OctopusDispatcherManager::ColumSize(uint64_t uuid) const{
-    size_t sz=0;
-    auto first_it=tables_.find(uuid);
-    if(first_it!=tables_.end()){
-        sz=first_it->second.size();
-    }
-    return sz;
 }
 
 OctopusBase::OctopusBase(BaseContext *context,int fd):
@@ -242,7 +217,7 @@ private:
     OctopusHand *entity_;
 };
 OctopusHand::OctopusHand(BaseContext *context,int fd,OctopusHandRole role,
-        OctopusDispatcherManager *manager,OctopusDispatcher *dispatcher)
+        OctopusDispatcherManager &manager,OctopusDispatcher *dispatcher)
 :OctopusBase(context,fd),role_(role),manager_(manager),dispatcher_(dispatcher){
     if(OCTOPUS_HAND_SERVER==role_){
         status_=OCTOPUS_CONN_CONNECTED;
@@ -261,8 +236,7 @@ OctopusHand::~OctopusHand(){
     }
     DLOG(INFO)<<Name()<<" dtor "<<send_bytes_<<" "<<recv_bytes_;
 }
-void OctopusHand::WriteMeta(uint64_t uuid,uint64_t ssid,const struct sockaddr_storage &src_saddr,
-        const struct sockaddr_storage &dst_saddr,bool sp_flag){
+void OctopusHand::WriteMeta(OctopusSessionKey &uuid,bool sp_flag){
     if(OCTOPUS_HAND_SERVER==role_){
         return;
     }
@@ -271,30 +245,12 @@ void OctopusHand::WriteMeta(uint64_t uuid,uint64_t ssid,const struct sockaddr_st
         DataWriter writer(buffer,kBufferSize);
         uint8_t type=OCTOPUS_MSG_META;
         sp_flag_=sp_flag;
-        uint32_t src_ip32,dst_ip32;
-        uint16_t src_port,dst_port;
-        {
-            SocketAddress socket_addr(src_saddr);
-            IpAddress host=socket_addr.host();
-            in_addr ipv4=host.GetIPv4();
-            memcpy(&src_ip32,&ipv4,sizeof(src_ip32));
-            src_port=socket_addr.port();
-        }
-        {
-            SocketAddress socket_addr(dst_saddr);
-            IpAddress host=socket_addr.host();
-            in_addr ipv4=host.GetIPv4();
-            memcpy(&dst_ip32,&ipv4,sizeof(dst_ip32));
-            dst_port=socket_addr.port();
-        }
         bool success=writer.WriteUInt8(type)&&
                 writer.WriteUInt8(sp_flag)&&
-                writer.WriteVarInt(uuid)&&
-                writer.WriteVarInt(ssid)&&
-                writer.WriteUInt32(src_ip32)&&
-                writer.WriteUInt32(dst_ip32)&&
-                writer.WriteUInt16(src_port)&&
-                writer.WriteUInt16(dst_port);
+                writer.WriteUInt32(uuid.from)&&
+                writer.WriteUInt32(uuid.to)&&
+                writer.WriteUInt16(uuid.src_port)&&
+                writer.WriteUInt16(uuid.dst_port);
         int old=wb_.size();
         wb_.resize(old+writer.length());
         memcpy(&wb_[old],writer.data(),writer.length());
@@ -541,42 +497,44 @@ void OctopusHand::CalleeParseMeta(){
         DataReader reader(&rb_[0],rb_.size());
         uint8_t type=0;
         uint8_t sp=0;
-        uint64_t uuid=0;
-        uint64_t ssid=0;
-        in_addr src_ipv4,dst_ipv4;
-        uint16_t src_port,dst_port;
+        OctopusSessionKey uuid;
         bool success=reader.ReadUInt8(&type)&&
                 reader.ReadUInt8(&sp)&&
-                reader.ReadVarInt(&uuid)&&
-                reader.ReadVarInt(&ssid)&&
-                reader.ReadUInt32((uint32_t*)&src_ipv4)&&
-                reader.ReadUInt32((uint32_t*)&dst_ipv4)&&
-                reader.ReadUInt16(&src_port)&&
-                reader.ReadUInt16(&dst_port);
+                reader.ReadUInt32(&uuid.from)&&
+                reader.ReadUInt32(&uuid.to)&&
+                reader.ReadUInt16(&uuid.src_port)&&
+                reader.ReadUInt16(&uuid.dst_port);
         if(success){
             msg_flag_|=OCTOPUS_META_FLAG;
             sp_flag_=sp;
-            CHECK(manager_!=nullptr);
-            OctopusDispatcher *dispatcher=manager_->Find(uuid,ssid);
+            CHECK(&manager_!=nullptr);
+            OctopusDispatcher *dispatcher=manager_.Find(uuid);
             if(nullptr==dispatcher){
                 sockaddr_storage src_saddr;
                 sockaddr_storage dst_saddr;
                 {
-                    IpAddress ip_addr(src_ipv4);
-                    SocketAddress socket_addr(ip_addr,src_port);
+                	in_addr  ipv4;
+                	memcpy(&ipv4,&uuid.from,sizeof(uuid.from));
+                    IpAddress ip_addr(ipv4);
+                    SocketAddress socket_addr(ip_addr,uuid.src_port);
                     src_saddr=socket_addr.generic_address();
                     DLOG(INFO)<<"origin src "<<socket_addr.ToString();
                 }
                 {
-                    IpAddress ip_addr(dst_ipv4);
-                    SocketAddress socket_addr(ip_addr,dst_port);
+                	in_addr  ipv4;
+                	memcpy(&ipv4,&uuid.to,sizeof(uuid.to));
+                    IpAddress ip_addr(ipv4);
+                    SocketAddress socket_addr(ip_addr,uuid.dst_port);
                     dst_saddr=socket_addr.generic_address();
                     DLOG(INFO)<<"origin dst "<<socket_addr.ToString();
                 }
                 bool positive=false;
                 int sock=bind_addr((sockaddr*)&src_saddr,true);
                 if(sock>0){
-                    dispatcher_=new OctopusDispatcher(context_,sock,uuid,ssid,OCTOPUS_DISPATCHER_SERVER,manager_);
+                    dispatcher_=new OctopusDispatcher(context_,sock,uuid,OCTOPUS_DISPATCHER_SERVER,manager_);
+                    if(!sp_flag_){
+                        manager_.Register(uuid,dispatcher_);
+                    }
                     if(dispatcher_->AsynConnect((const struct sockaddr*)&dst_saddr,sizeof(struct sockaddr_in))){
                         dispatcher_->RegisterHand(this);
                         positive=true;
@@ -631,9 +589,9 @@ public:
 private:
 	OctopusDispatcher *entity_;
 };
-OctopusDispatcher::OctopusDispatcher(BaseContext *context,int fd,uint64_t uuid,uint64_t ssid,
-		OctopusDispatcherRole role,OctopusDispatcherManager *manager)
-:OctopusBase(context,fd),uuid_(uuid),ssid_(ssid),role_(role),manager_(manager){
+OctopusDispatcher::OctopusDispatcher(BaseContext *context,int fd,OctopusSessionKey &uuid,
+		OctopusDispatcherRole role,OctopusDispatcherManager &manager)
+:OctopusBase(context,fd),uuid_(uuid),role_(role),manager_(manager){
     if(OCTOPUS_DISPATCHER_CLIENT==role_){
         //client will not depend on epoll
         octopus_nonblocking(fd_);
@@ -673,15 +631,13 @@ void OctopusDispatcher::SignalFrom(OctopusHand*hand,OctopusSignalCode code){
     }
     DLOG(INFO)<<Name()<<" "<<OctopusSignalCodeToString(code);
 }
-bool OctopusDispatcher::CreateSingleConnection(const sockaddr_storage &origin_src_saddr,
-                                const sockaddr_storage &origin_dst_saddr,
-                                const sockaddr_storage &proxy_src_saddr,
+bool OctopusDispatcher::CreateSingleConnection(const sockaddr_storage &proxy_src_saddr,
                                 const sockaddr_storage &proxy_dst_saddr){
     bool success=false;
     int sock=bind_addr((sockaddr*)&proxy_src_saddr,false);
     if (sock>0){
         OctopusHand *hand=new OctopusHand(context_,sock,OCTOPUS_HAND_CLIENT,manager_,this);
-        hand->WriteMeta(uuid_,ssid_,origin_src_saddr,origin_dst_saddr,true);
+        hand->WriteMeta(uuid_,true);
         if(hand->AsynConnect((const struct sockaddr*)&proxy_dst_saddr,sizeof(struct sockaddr_in))){
             success=true;
             wait_hands_.insert(hand);
@@ -692,9 +648,7 @@ bool OctopusDispatcher::CreateSingleConnection(const sockaddr_storage &origin_sr
     }
     return success;
 }
-bool OctopusDispatcher::CreateMutipleConnections(const sockaddr_storage &origin_src_saddr,
-    const sockaddr_storage &origin_dst_saddr,
-    const std::vector<std::pair<sockaddr_storage,sockaddr_storage>>& proxy_saddrs){
+bool OctopusDispatcher::CreateMutipleConnections(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>>& proxy_saddrs){
     return false;
 }
 bool OctopusDispatcher::AsynConnect(const struct sockaddr *addr,socklen_t addrlen){
@@ -846,9 +800,8 @@ void OctopusDispatcher::ConnClose(OctopusSignalCode code){
     ready_hands_.clear();
     CHECK(ready_hands_.size()==0);
     status_=OCTOPUS_CONN_DISCONN;
-    if(manager_!=nullptr){
-    	manager_->UnRegister(uuid_,ssid_);
-        manager_=nullptr;
+    if(&manager_!=nullptr){
+    	manager_.UnRegister(uuid_);
     }
     context_->epoll_server()->UnregisterFD(fd_);
     context_->UnRegisterExitVisitor(this);
@@ -865,46 +818,130 @@ void OctopusDispatcher::DeleteSelf(){
     });
 }
 
-OctopusCallerBackend::OctopusCallerBackend(uint64_t uuid,
-		const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec):
-uuid_(uuid),proxy_saddr_vec_(proxy_saddr_vec){}
+OctopusCallerBackend::OctopusCallerBackend(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec)
+:proxy_saddr_vec_(proxy_saddr_vec){}
 void OctopusCallerBackend::CreateEndpoint(BaseContext *context,int fd){
     sockaddr_storage origin_src_saddr;
     sockaddr_storage origin_dst_saddr;
+    OctopusSessionKey uuid;
     socklen_t addr_len = sizeof(sockaddr_storage);
     getpeername(fd,(sockaddr*)&origin_src_saddr,&addr_len);
     getsockname(fd,(sockaddr*)&origin_dst_saddr,&addr_len);
 {
     SocketAddress socket_addr(origin_src_saddr);
+    IpAddress host=socket_addr.host();
+    in_addr ipv4=host.GetIPv4();
+    memcpy(&uuid.from,&ipv4,sizeof(uuid.from));
+    uuid.src_port=socket_addr.port();
     DLOG(INFO)<<"origin src "<<socket_addr.ToString();
 }
 {
     SocketAddress socket_addr(origin_dst_saddr);
+    IpAddress host=socket_addr.host();
+    in_addr ipv4=host.GetIPv4();
+    memcpy(&uuid.to,&ipv4,sizeof(uuid.to));
+    uuid.dst_port=socket_addr.port();
     DLOG(INFO)<<"origin dst "<<socket_addr.ToString();
 }
 
     CHECK(proxy_saddr_vec_.size()>0);
-    OctopusDispatcher *dispatcher=new OctopusDispatcher(context,fd,uuid_,ssid_,
-    				OCTOPUS_DISPATCHER_CLIENT,nullptr);
-    dispatcher->CreateSingleConnection(origin_src_saddr,origin_dst_saddr,
-    		proxy_saddr_vec_[0].first,proxy_saddr_vec_[0].second);
-    ssid_+=1;
+    OctopusDispatcher *dispatcher=new OctopusDispatcher(context,fd,uuid,
+    				OCTOPUS_DISPATCHER_CLIENT,create_null_ref<OctopusDispatcherManager>());
+    dispatcher->CreateSingleConnection(proxy_saddr_vec_[0].first,proxy_saddr_vec_[0].second);
     UNUSED(dispatcher);
 }
-OctopusCallerSocketFactory::OctopusCallerSocketFactory(uint64_t uuid,
-		const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec):
-			uuid_(uuid),proxy_saddr_vec_(proxy_saddr_vec){}
+OctopusCallerSocketFactory::OctopusCallerSocketFactory(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec)
+:proxy_saddr_vec_(proxy_saddr_vec){}
 PhysicalSocketServer* OctopusCallerSocketFactory::CreateSocketServer(BaseContext *context){
-	 std::unique_ptr<OctopusCallerBackend> backend(new OctopusCallerBackend(uuid_,proxy_saddr_vec_));
+	 std::unique_ptr<OctopusCallerBackend> backend(new OctopusCallerBackend(proxy_saddr_vec_));
 	 return new PhysicalSocketServer(context,std::move(backend));
 }
 void OctopusCalleeBackend::CreateEndpoint(BaseContext *context,int fd){
-	OctopusHand *hand=new OctopusHand(context,fd,OCTOPUS_HAND_SERVER,&manager_,nullptr);
+	OctopusHand *hand=new OctopusHand(context,fd,OCTOPUS_HAND_SERVER,manager_,nullptr);
 	UNUSED(hand);
 }
 PhysicalSocketServer* OctopusCalleeSocketFactory::CreateSocketServer(BaseContext *context){
-	std::unique_ptr<OctopusCalleeBackend> backend(new OctopusCalleeBackend());
-	return new PhysicalSocketServer(context,std::move(backend));
+    std::unique_ptr<OctopusCalleeBackend> backend(new OctopusCalleeBackend());
+    return new PhysicalSocketServer(context,std::move(backend));
+}
+int octopus_write_pid (const char *pidfile)
+{
+  FILE *f;
+  int fd;
+  int pid;
+
+  if ( ((fd = open(pidfile, O_RDWR|O_CREAT, 0644)) == -1)
+       || ((f = fdopen(fd, "r+")) == NULL) ) {
+      fprintf(stderr, "Can't open or create %s.\n", pidfile ? pidfile : "(null)");
+      return 0;
+  }
+  
+#ifdef HAVE_FLOCK
+  if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
+      fscanf(f, "%d", &pid);
+      fclose(f);
+      printf("Can't lock, lock is held by pid %d.\n", pid);
+      return 0;
+  }
+#endif
+
+  pid = getpid();
+  if (!fprintf(f,"%d\n", pid)) {
+      printf("Can't write pid , %s.\n", strerror(errno));
+      close(fd);
+      return 0;
+  }
+  fflush(f);
+
+#ifdef HAVE_FLOCK
+  if (flock(fd, LOCK_UN) == -1) {
+      printf("Can't unlock pidfile %s, %s.\n", pidfile, strerror(errno));
+      close(fd);
+      return 0;
+  }
+#endif
+  close(fd);
+
+  return pid;
+}
+int octopus_read_pid(const char *pidfile)
+{
+  FILE *f;
+  int pid;
+
+  if (!(f=fopen(pidfile,"r")))
+    return 0;
+  fscanf(f,"%d", &pid);
+  fclose(f);
+  return pid;
+}
+int octopus_remove_pid(const char *pidfile)
+{
+  return unlink (pidfile);
+}
+void octopus_daemonise(void)
+{
+    char *err;
+    pid_t pid;
+    
+    pid = fork();
+    if(pid < 0){
+        err = strerror(errno);
+        std::cout<<"error in fork "<<err<<std::endl;
+        exit(1);
+    }
+    if(pid > 0){
+        exit(0);
+    }
+    if(setsid() < 0){
+        err = strerror(errno);
+        std::cout<<"Error in setsid "<<err<<std::endl;
+        exit(1);
+    }
+    
+    assert(freopen("/dev/null", "r", stdin));
+    assert(freopen("/dev/null", "w", stdout));
+    assert(freopen("/dev/null", "w", stderr));
 }
 }
 
