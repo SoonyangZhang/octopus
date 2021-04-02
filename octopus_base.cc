@@ -234,7 +234,7 @@ OctopusHand::~OctopusHand(){
     if(out_bw_alarm_){
         out_bw_alarm_->Cancel();
     }
-    DLOG(INFO)<<Name()<<" dtor "<<send_bytes_<<" "<<recv_bytes_;
+    DLOG(INFO)<<this<<Name()<<"dtor "<<send_bytes_<<" "<<recv_bytes_;
 }
 void OctopusHand::WriteMeta(OctopusSessionKey &uuid,bool sp_flag){
     if(OCTOPUS_HAND_SERVER==role_){
@@ -281,11 +281,13 @@ bool OctopusHand::AsynConnect(const struct sockaddr *addr,socklen_t addrlen){
     return true;
 }
 void OctopusHand::SignalFrom(OctopusDispatcher* dispatcher,OctopusSignalCode code){
-    if(OCTOPUS_HAND_SERVER==role_){
+    DLOG(INFO)<<this<<Name()<<" "<<OctopusSignalCodeToString(code);
+	if(OCTOPUS_HAND_SERVER==role_){
         if(OCTOPUS_SIG_DST_FAILED==code||OCTOPUS_SIG_DST_CONNECTED==code){
             SendMetaAck(code);
-            if(OCTOPUS_SIG_CONN_FAILED==code){
-                ConnClose(code);
+            if(OCTOPUS_SIG_DST_FAILED==code){
+                dispatcher_=nullptr;
+            	ConnClose(code);
             }
         }
     }
@@ -296,7 +298,6 @@ void OctopusHand::SignalFrom(OctopusDispatcher* dispatcher,OctopusSignalCode cod
             ConnClose(code);
         }
     }
-    DLOG(INFO)<<Name()<<" "<<OctopusSignalCodeToString(code);
 }
 void OctopusHand::Sink(const char *pv,int sz){
     if(!out_bw_alarm_){
@@ -387,6 +388,7 @@ void OctopusHand::OnCallerEvent(int fd, EpollEvent* event){
         }else{
             ConnClose(OCTOPUS_SIG_CONN_DISCONN);
         }
+        return;
     }
     if(fd_>0&&(event->in_events&EPOLLIN)){
         if(sp_flag_){
@@ -430,7 +432,7 @@ void OctopusHand::OnCallerEvent(int fd, EpollEvent* event){
             //TODO multipath,parser offset
         }
     }
-    if(fd>0&&(event->in_events&EPOLLOUT)){
+    if(fd_>0&&(event->in_events&EPOLLOUT)){
         if (OCTOPUS_CONN_CONNECTING==status_){
             status_=OCTOPUS_CONN_CONNECTED;
             if(OctopusEpollETFlag){
@@ -455,7 +457,8 @@ void OctopusHand::OnCalleeEvent(int fd, EpollEvent* event){
         while(true){
             int n=read(fd_,buffer,kBufferSize);
             if(-1==n){
-                if(EAGAIN==errno){
+                if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
+                    break;
                 }else{
                     ConnClose(OCTOPUS_SIG_CONN_DISCONN);
                 }
@@ -481,12 +484,11 @@ void OctopusHand::OnCalleeEvent(int fd, EpollEvent* event){
         }
     }
 }
-inline void OctopusHand::ConnClose(OctopusSignalCode code){
-    //server client 
+void OctopusHand::ConnClose(OctopusSignalCode code){
     if(dispatcher_){
         dispatcher_->SignalFrom(this,code);
+        dispatcher_=nullptr;
     }
-    dispatcher_=nullptr;
     status_=OCTOPUS_CONN_DISCONN;
     context_->epoll_server()->UnregisterFD(fd_);
     CloseFd();
@@ -518,7 +520,7 @@ void OctopusHand::CalleeParseMeta(){
                     IpAddress ip_addr(ipv4);
                     SocketAddress socket_addr(ip_addr,uuid.src_port);
                     src_saddr=socket_addr.generic_address();
-                    DLOG(INFO)<<"origin src "<<socket_addr.ToString();
+                    DLOG(INFO)<<this<<Name()<<"origin src "<<socket_addr.ToString();
                 }
                 {
                 	in_addr  ipv4;
@@ -526,7 +528,7 @@ void OctopusHand::CalleeParseMeta(){
                     IpAddress ip_addr(ipv4);
                     SocketAddress socket_addr(ip_addr,uuid.dst_port);
                     dst_saddr=socket_addr.generic_address();
-                    DLOG(INFO)<<"origin dst "<<socket_addr.ToString();
+                    DLOG(INFO)<<this<<Name()<<"origin dst "<<socket_addr.ToString();
                 }
                 bool positive=false;
                 int sock=bind_addr((sockaddr*)&src_saddr,true);
@@ -539,6 +541,8 @@ void OctopusHand::CalleeParseMeta(){
                         dispatcher_->RegisterHand(this);
                         positive=true;
                     }
+                }else{
+                    DLOG(INFO)<<this<<Name()<<"bind failed";
                 }
                 if(!positive){
                     SendMetaAck(OCTOPUS_SIG_DST_FAILED);
@@ -567,7 +571,7 @@ void OctopusHand::SendMetaAck(OctopusSignalCode code){
         CHECK(type!=0);
         send(fd_,(const void*)&type,sizeof(type),0);
         send_bytes_+=1;
-        DLOG(INFO)<<OctopusSignalCodeToString(code);
+        DLOG(INFO)<<this<<Name()<<OctopusSignalCodeToString(code);
     }
 }
 void OctopusHand::DeleteSelf(){
@@ -605,10 +609,11 @@ OctopusDispatcher::~OctopusDispatcher(){
 	if(socket_alarm_){
 		socket_alarm_->Cancel();
 	}
-    DLOG(INFO)<<Name()<<" dtor "<<send_bytes_<<" "<<recv_bytes_;
+    DLOG(INFO)<<this<<Name()<<"dtor "<<send_bytes_<<" "<<recv_bytes_;
 }
 void OctopusDispatcher::SignalFrom(OctopusHand*hand,OctopusSignalCode code){
-    if(OCTOPUS_DISPATCHER_CLIENT==role_){
+    DLOG(INFO)<<Name()<<" "<<OctopusSignalCodeToString(code);
+	if(OCTOPUS_DISPATCHER_CLIENT==role_){
         if(OCTOPUS_SIG_DST_CONNECTED==code){
             wait_hands_.erase(hand);
             ready_hands_.insert(hand);
@@ -629,7 +634,6 @@ void OctopusDispatcher::SignalFrom(OctopusHand*hand,OctopusSignalCode code){
             }
         }
     }
-    DLOG(INFO)<<Name()<<" "<<OctopusSignalCodeToString(code);
 }
 bool OctopusDispatcher::CreateSingleConnection(const sockaddr_storage &proxy_src_saddr,
                                 const sockaddr_storage &proxy_dst_saddr){
@@ -708,13 +712,14 @@ void OctopusDispatcher::OnEvent(int fd, EpollEvent* event){
 //only call once
     if(event->in_events&(EPOLLERR|EPOLLHUP)){
         if(OCTOPUS_CONN_CONNECTING==status_){
+        	DLOG(INFO)<<this<<Name()<<" "<<OctopusSignalCodeToString(OCTOPUS_SIG_DST_FAILED);
             ConnClose(OCTOPUS_SIG_DST_FAILED);
         }
     }
     if(fd_>0&&(event->in_events&EPOLLOUT)){
         if(OCTOPUS_CONN_CONNECTING==status_){
             status_=OCTOPUS_CONN_CONNECTED;
-            DLOG(INFO)<<"connect to origin dst "<<wait_hands_.size();
+            DLOG(INFO)<<this<<Name()<<"connect to origin dst "<<wait_hands_.size();
             for(auto it=wait_hands_.begin();it!=wait_hands_.end();it++){
                 OctopusHand *hand=(*it);
                 hand->SignalFrom(this,OCTOPUS_SIG_DST_CONNECTED);

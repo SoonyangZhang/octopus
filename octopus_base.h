@@ -87,15 +87,15 @@ protected:
 };
 class OctopusHand:public OctopusBase,public EpollCallbackInterface{
 public:
-	OctopusHand(BaseContext *context,int fd,OctopusHandRole role,
-			 OctopusDispatcherManager &manager,OctopusDispatcher *dispatcher);
-	~OctopusHand();
-	void WriteMeta(OctopusSessionKey &uuid,bool sp_flag=true);
-	bool AsynConnect(const struct sockaddr * addr,socklen_t addrlen);
-	void SignalFrom(OctopusDispatcher* dispatcher,OctopusSignalCode code);
-	void Sink(const char *pv,int sz);
-	//for multipath transmission
-	void SinkWithOff(uint64_t offset,const char *pv,int sz);
+    OctopusHand(BaseContext *context,int fd,OctopusHandRole role,
+            OctopusDispatcherManager &manager,OctopusDispatcher *dispatcher);
+    ~OctopusHand();
+    void WriteMeta(OctopusSessionKey &uuid,bool sp_flag=true);
+    bool AsynConnect(const struct sockaddr * addr,socklen_t addrlen);
+    void SignalFrom(OctopusDispatcher* dispatcher,OctopusSignalCode code);
+    void Sink(const char *pv,int sz);
+    //for multipath transmission
+    void SinkWithOff(uint64_t offset,const char *pv,int sz);
     // From EpollCallbackInterface
     void OnRegistration(EpollServer* eps, int fd, int event_mask) override{}
     void OnModification(int fd, int event_mask) override {}
@@ -103,21 +103,21 @@ public:
     void OnUnregistration(int fd, bool replaced) override {}
     void OnShutdown(EpollServer* eps, int fd) override;
     std::string Name() const override;
-	void OutBandwidthAlarm();
+    void OutBandwidthAlarm();
 private:
     void OnCallerEvent(int fd, EpollEvent* event);
     void OnCalleeEvent(int fd, EpollEvent* event);
     void ConnClose(OctopusSignalCode code);
-	void CalleeParseMeta();
-	void SendMetaAck(OctopusSignalCode code);
+    void CalleeParseMeta();
+    void SendMetaAck(OctopusSignalCode code);
     void DeleteSelf();
-	OctopusHandRole role_;
-	OctopusDispatcherManager &manager_;
-	OctopusDispatcher *dispatcher_=nullptr;
-	std::unique_ptr<BaseAlarm> out_bw_alarm_;
-	uint8_t msg_flag_=0;
-	bool sp_flag_=true;
-	bool wait_close_=false;
+    OctopusHandRole role_;
+    OctopusDispatcherManager &manager_;
+    OctopusDispatcher *dispatcher_=nullptr;
+    std::unique_ptr<BaseAlarm> out_bw_alarm_;
+    uint8_t msg_flag_=0;
+    bool sp_flag_=true;
+    bool wait_close_=false;
 };
 // default single path
 class OctopusDispatcher:public OctopusBase,public EpollCallbackInterface,

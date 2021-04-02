@@ -80,10 +80,10 @@ using namespace basic;
 namespace basic{
 class OctopusService:public BaseThread{
 public:
-	bool Init(std::string &service_ip,uint16_t service_port);
-	void Run() override;
+    bool Init(std::string &service_ip,uint16_t service_port);
+    void Run() override;
 private:
-	std::unique_ptr<TcpServer> tcp_server_;
+    std::unique_ptr<TcpServer> tcp_server_;
 };
 bool OctopusService::Init(std::string &service_ip,uint16_t service_port){
     IpAddress ip_addr;
@@ -92,14 +92,14 @@ bool OctopusService::Init(std::string &service_ip,uint16_t service_port){
     tcp_server_.reset(new TcpServer(std::move(socket_factory)));
     bool success=tcp_server_->Init(ip_addr,service_port);
     if(!success){
-    	tcp_server_.reset(nullptr);
+        tcp_server_.reset(nullptr);
     }
     return success;
 }
 void OctopusService::Run(){
-	while(running_&&tcp_server_){
-		tcp_server_->HandleEvent();
-	}
+    while(running_&&tcp_server_){
+        tcp_server_->HandleEvent();
+    }
 }
 }
 int main(int argc, char *argv[]){
@@ -180,6 +180,21 @@ int main(int argc, char *argv[]){
     if(0==octopus_write_pid(pid_pathname.c_str())){
         return -1;
     }
+    /*
+        block sigpipe for pthread
+        https://blog.csdn.net/suifengpiao_2011/article/details/51837805
+        http://www.microhowto.info/howto/ignore_sigpipe_without_affecting_other_threads_in_a_process.html
+        https://riptutorial.com/posix/example/17424/handle-sigpipe-generated-by-write---in-a-thread-safe-manner
+    */
+    sigset_t signal_mask;
+    sigemptyset (&signal_mask);
+    sigaddset (&signal_mask, SIGPIPE);
+    int rc = pthread_sigmask (SIG_BLOCK, &signal_mask, NULL);
+    if (rc != 0)
+    {
+        LOG(INFO)<<"block sigpipe error";
+        return -1;
+    } 
     std::unique_ptr<OctopusCallerSocketFactory> socket_factory(new OctopusCallerSocketFactory(proxy_saddr_vec));
     TcpServer server(std::move(socket_factory));
     PhysicalSocketServer *socket_server=server.socket_server();
