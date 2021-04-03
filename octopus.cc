@@ -7,6 +7,7 @@
 #include "base/cmdline.h"
 #include "base/base_ini.h"
 #include "base/base_thread.h"
+#include "base/ip_address.h"
 #include "logging/logging.h"
 #include "octopus/octopus_base.h"
 #include "tcp/tcp_server.h"
@@ -21,7 +22,7 @@ static void octopus_signal_handler(int signo, siginfo_t *siginfo, void *ucontext
             g_running=false;
             break;
         case SIGPIPE:
-            LOG(INFO)<<"ignore sigpipe";
+            DLOG(INFO)<<"ignore sigpipe";
             break;
         default:
             break;
@@ -56,7 +57,7 @@ int octopus_init_signals()
         }
         sigemptyset(&sa.sa_mask);
         if (sigaction(sig->signo, &sa, NULL) == -1) {
-            LOG(ERROR)<<"error init signal "<<sig->name<<std::endl;
+            DLOG(ERROR)<<"error init signal "<<sig->name<<std::endl;
         }
     }
     return 0;
@@ -66,9 +67,11 @@ int octopus_fire_signal(const char *name,int pid){
     for (sig = signals; sig->signo != 0; sig++) {
         if (strcmp(name, sig->name) == 0) {
             if (kill(pid, sig->signo) == -1){
-                LOG(ERROR)<<"error fire signal "<<sig->name<<std::endl;
+                DLOG(ERROR)<<"error fire signal "<<sig->name<<std::endl;
                 return -1;
             }else{
+                int status=0;
+                waitpid(pid,&status,0);
                 break;
             }
         }
@@ -101,6 +104,16 @@ void OctopusService::Run(){
         tcp_server_->HandleEvent();
     }
 }
+bool CheckIpExist(std::vector<IpAddress> &ip_vec, IpAddress &ele){
+    bool exist=false;
+    for(int i=0;i<ip_vec.size();i++){
+        if(ip_vec[i]==ele){
+            exist=true;
+            break;
+        }
+    }
+    return exist;
+}
 }
 int main(int argc, char *argv[]){
     octopus_init_signals();
@@ -117,7 +130,7 @@ int main(int argc, char *argv[]){
     uint16_t capture_port=0,service_port=0;
     std::vector<std::pair<sockaddr_storage,sockaddr_storage>> proxy_saddr_vec;
     if (geteuid() != 0){
-        LOG(INFO)<<"please run in root mode";
+        DLOG(INFO)<<"please run in root mode";
         return -1;
     }
     if(0==action.compare("stop")){
@@ -125,59 +138,65 @@ int main(int argc, char *argv[]){
         if(pid>0){
            octopus_fire_signal(action.c_str(),pid);
         }
-        return 1;
+        return 0;
+    }
+    int pid=octopus_read_pid(pid_pathname.c_str());
+    if(pid){
+        DLOG(INFO)<<" oct is already running";
+        return 0;
     }
     ini_t *config=ini_load(conf_pathname.c_str());
     if(!config){
-        LOG(ERROR)<<"./oct -c oct.conf";
+        DLOG(ERROR)<<"./oct -c oct.conf";
         return -1;
     }
+    std::vector<IpAddress> host_ip_vec;
+    GetLocalIpAddress(host_ip_vec);
     std::string route("route");
     const char *route_str_v=ini_get(config,"number",route.c_str());
     if(route_str_v){
         int n=std::stoi(route_str_v);
         for (int i=0;i<n;i++){
-        	std::string segment=route+std::to_string(i+1);
-        	const char *local_ip_str=ini_get(config,segment.c_str(),"local_ip");
-        	const char *peer_ip_str=ini_get(config,segment.c_str(),"peer_ip");
-        	const char *peer_port_str=ini_get(config,segment.c_str(),"peer_port");
-        	if(local_ip_str&&peer_ip_str&&peer_port_str){
+                std::string segment=route+std::to_string(i+1);
+                const char *local_ip_str=ini_get(config,segment.c_str(),"local_ip");
+                const char *peer_ip_str=ini_get(config,segment.c_str(),"peer_ip");
+                const char *peer_port_str=ini_get(config,segment.c_str(),"peer_port");
+                if(local_ip_str&&peer_ip_str&&peer_port_str){
                 IpAddress ip_src;
                 IpAddress ip_dst;
                 ip_src.FromString(local_ip_str);
                 ip_dst.FromString(peer_ip_str);
                 uint16_t proxy_src_port=0;
                 uint16_t proxy_dst_port=std::stoi(peer_port_str);
-                LOG(INFO)<<peer_ip_str<<":"<<proxy_dst_port;
+                if (!CheckIpExist(host_ip_vec,ip_src)){
+                    DLOG(ERROR)<<"local address is wrong";
+                    return -1;
+                }
+                DLOG(INFO)<<peer_ip_str<<":"<<proxy_dst_port;
                 SocketAddress socket_addr_src(ip_src,proxy_src_port);
                 SocketAddress socket_addr_dst(ip_dst,proxy_dst_port);
                 sockaddr_storage saddr_from=socket_addr_src.generic_address();
                 sockaddr_storage saddr_to=socket_addr_dst.generic_address();
                 proxy_saddr_vec.push_back(std::make_pair(saddr_from,saddr_to));
-        	}else{
-        		LOG(ERROR)<<"wrong config";
-        		return -1;
-        	}
+            }else{
+                DLOG(ERROR)<<"wrong config in route section";
+                return -1;
+            }
         }
     }
     const char *capture_port_str=ini_get(config,"service","capture_port");
     const char *service_port_str=ini_get(config,"service","service_port");
     if(capture_port_str&&service_port_str){
-    	capture_port=std::stoi(capture_port_str);
-    	service_port=std::stoi(service_port_str);;
-        LOG(INFO)<<capture_port<<":"<<service_port;
+        capture_port=std::stoi(capture_port_str);
+        service_port=std::stoi(service_port_str);;
+        DLOG(INFO)<<capture_port<<":"<<service_port;
     }else{
-		LOG(ERROR)<<"wrong config";
-		return -1;
+        DLOG(ERROR)<<"wrong config in sevice section";
+        return -1;
     }
-    int pid=octopus_read_pid(pid_pathname.c_str());
-    if(pid){
-        if(octopus_fire_signal(octopus_str_value(OCTOPUS_TERMINATE_SIGNAL),pid)!=0){
-            return -1;
-        }
-        octopus_remove_pid(pid_pathname.c_str());
-    }
+    octopus_daemonise();
     if(0==octopus_write_pid(pid_pathname.c_str())){
+        DLOG(ERROR)<<"write pid failed";
         return -1;
     }
     /*
@@ -192,7 +211,7 @@ int main(int argc, char *argv[]){
     int rc = pthread_sigmask (SIG_BLOCK, &signal_mask, NULL);
     if (rc != 0)
     {
-        LOG(INFO)<<"block sigpipe error";
+        DLOG(INFO)<<"block sigpipe error";
         return -1;
     } 
     std::unique_ptr<OctopusCallerSocketFactory> socket_factory(new OctopusCallerSocketFactory(proxy_saddr_vec));
@@ -211,6 +230,7 @@ int main(int argc, char *argv[]){
     bool success=server.Init(ip_addr,capture_port);
     OctopusService service;
     if(!service.Init(service_ip,service_port)){
+        DLOG(ERROR)<<"start service failed";
     	return -1;
     }
     service.Start();

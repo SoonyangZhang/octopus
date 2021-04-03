@@ -1,6 +1,9 @@
 #pragma once
 #include <stdint.h>
 #include <string>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <errno.h>
 #include <signal.h>
 #include <atomic>
 #include <memory>
