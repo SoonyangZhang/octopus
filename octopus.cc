@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <iostream>
+#include <stdio.h>
 #include <string>
 #include <vector>
 #include <memory>
@@ -10,6 +11,7 @@
 #include "base/ip_address.h"
 #include "logging/logging.h"
 #include "octopus/octopus_base.h"
+//#include "octopus/arp_server.h"
 #include "tcp/tcp_server.h"
 static volatile bool g_running=true;
 static void octopus_signal_handler(int signo, siginfo_t *siginfo, void *ucontext){
@@ -119,14 +121,18 @@ int main(int argc, char *argv[]){
     octopus_init_signals();
     cmdline::parser a;
     a.add<std::string>("signal", 's', "signal", false, "none");
-    a.add<string>("conf", 'c', "config file", false, "oct.conf");
-    a.add<string>("pid", 'p', "pid file", false, "oct.pid");
+    a.add<string>("config", 'c', "config file", false, "oct.conf");
+    a.add<string>("pidfile", 'p', "pid file", false, "oct.pid");
     a.parse_check(argc, argv);
     std::string action=a.get<std::string>("signal");
-    std::string conf_pathname=a.get<string>("conf");
-    std::string pid_pathname=a.get<string>("pid");
+    std::string conf_pathname=a.get<string>("config");
+    std::string pid_pathname=a.get<string>("pidfile");
     std::string capture_ip("0.0.0.0");
     std::string service_ip("0.0.0.0");
+    std::string ifname("eth0");
+    std::vector<IpAddress> host_ip_vec;
+    std::vector<IpAddress> iptables;
+    std::set<uint32_t> ip_set;
     uint16_t capture_port=0,service_port=0;
     std::vector<std::pair<sockaddr_storage,sockaddr_storage>> proxy_saddr_vec;
     if (geteuid() != 0){
@@ -150,53 +156,183 @@ int main(int argc, char *argv[]){
         DLOG(ERROR)<<"./oct -c oct.conf";
         return -1;
     }
-    std::vector<IpAddress> host_ip_vec;
     GetLocalIpAddress(host_ip_vec);
-    std::string route("route");
-    const char *route_str_v=ini_get(config,"number",route.c_str());
-    if(route_str_v){
-        int n=std::stoi(route_str_v);
-        for (int i=0;i<n;i++){
-                std::string segment=route+std::to_string(i+1);
-                const char *local_ip_str=ini_get(config,segment.c_str(),"local_ip");
-                const char *peer_ip_str=ini_get(config,segment.c_str(),"peer_ip");
-                const char *peer_port_str=ini_get(config,segment.c_str(),"peer_port");
-                if(local_ip_str&&peer_ip_str&&peer_port_str){
-                IpAddress ip_src;
-                IpAddress ip_dst;
-                ip_src.FromString(local_ip_str);
-                ip_dst.FromString(peer_ip_str);
-                uint16_t proxy_src_port=0;
-                uint16_t proxy_dst_port=std::stoi(peer_port_str);
-                if (!CheckIpExist(host_ip_vec,ip_src)){
-                    DLOG(ERROR)<<"local address is wrong";
-                    return -1;
+    {
+    	bool success=true;
+        std::string route("route");
+        const char *route_str_v=ini_get(config,"number",route.c_str());
+        if(route_str_v){
+            int n=std::stoi(route_str_v);
+            for (int i=0;i<n;i++){
+                    std::string segment=route+std::to_string(i+1);
+                    const char *local_ip_str=ini_get(config,segment.c_str(),"local_ip");
+                    const char *peer_ip_str=ini_get(config,segment.c_str(),"peer_ip");
+                    const char *peer_port_str=ini_get(config,segment.c_str(),"peer_port");
+                    if(local_ip_str&&peer_ip_str&&peer_port_str){
+                    IpAddress ip_src;
+                    IpAddress ip_dst;
+                    ip_src.FromString(local_ip_str);
+                    ip_dst.FromString(peer_ip_str);
+                    uint16_t proxy_src_port=0;
+                    uint16_t proxy_dst_port=std::stoi(peer_port_str);
+                    if (!CheckIpExist(host_ip_vec,ip_src)){
+                    	success=false;
+                        break;
+                    }
+                    DLOG(INFO)<<peer_ip_str<<":"<<proxy_dst_port;
+                    SocketAddress socket_addr_src(ip_src,proxy_src_port);
+                    SocketAddress socket_addr_dst(ip_dst,proxy_dst_port);
+                    sockaddr_storage saddr_from=socket_addr_src.generic_address();
+                    sockaddr_storage saddr_to=socket_addr_dst.generic_address();
+                    proxy_saddr_vec.push_back(std::make_pair(saddr_from,saddr_to));
+                }else{
+                	success=false;
+                    break;
                 }
-                DLOG(INFO)<<peer_ip_str<<":"<<proxy_dst_port;
-                SocketAddress socket_addr_src(ip_src,proxy_src_port);
-                SocketAddress socket_addr_dst(ip_dst,proxy_dst_port);
-                sockaddr_storage saddr_from=socket_addr_src.generic_address();
-                sockaddr_storage saddr_to=socket_addr_dst.generic_address();
-                proxy_saddr_vec.push_back(std::make_pair(saddr_from,saddr_to));
-            }else{
-                DLOG(ERROR)<<"wrong config in route section";
-                return -1;
             }
+        }else{
+        	success=false;
         }
+        if(!success){
+        	DLOG(ERROR)<<"wrong config in route section";
+        	return -1;
+        }
+
     }
     const char *capture_port_str=ini_get(config,"service","capture_port");
     const char *service_port_str=ini_get(config,"service","service_port");
-    if(capture_port_str&&service_port_str){
+    const char *capture_if_str=ini_get(config,"service","capture_if");
+    if(capture_port_str&&service_port_str&&capture_if_str){
         capture_port=std::stoi(capture_port_str);
-        service_port=std::stoi(service_port_str);;
-        DLOG(INFO)<<capture_port<<":"<<service_port;
+        service_port=std::stoi(service_port_str);
+        ifname=std::string(capture_if_str);
+        DLOG(INFO)<<capture_if_str;
     }else{
-        DLOG(ERROR)<<"wrong config in sevice section";
+        DLOG(ERROR)<<"wrong config in service section";
         return -1;
     }
+    {
+    	bool success=true;
+    	const char *ip_items_str=ini_get(config,"iptables","num");
+    	if(ip_items_str){
+    		int n=std::stoi(ip_items_str);
+    		for(int i=0;i<n;i++){
+                std::string key="ip"+std::to_string(i+1);
+                const char *ip_str=ini_get(config,"iptables",key.c_str());
+                if(ip_str){
+                	IpAddress ip_addr;
+                	ip_addr.FromString(ip_str);
+                	if(ip_addr.IsIPv4()){
+                		uint32_t key=0;
+                        struct in_addr temp=ip_addr.GetIPv4();
+                		memcpy((void*)&key,&temp,sizeof(key));
+                		ip_set.insert(key);
+                		iptables.push_back(ip_addr);
+                	}
+
+                }else{
+                	success=false;
+                	break;
+                }
+    		}
+    	}else{
+    		success=false;
+    	}
+    	if(!success){
+    		DLOG(ERROR)<<"wrong ip table";
+    		return -1;
+    	}
+    }
+
+
+    {
+    	bool suceess=true;
+    	char buffer[1500]={0};
+    	char *cmd="iptables -t mangle -N DIVERT&&"\
+    			"iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT &&"\
+				"iptables -t mangle -A DIVERT -j MARK --set-mark 1&&"\
+				"iptables -t mangle -A DIVERT -j ACCEPT&&"\
+				"ip rule add fwmark 1 lookup 100 &&"\
+				"ip route add local 0.0.0.0/0 dev lo table 100&&";
+    	std::string rule=std::string("iptables -t mangle -A PREROUTING -p tcp -d %s  -j TPROXY --tproxy-mark 0x1/0x1 --on-port ")+std::to_string(capture_port);
+    	if(suceess&&system("iptables -t mangle -N DIVERT")<0){
+    		DLOG(ERROR)<<strerror(errno);
+    		suceess=false;
+    	}
+    	if(suceess&&system("iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT")<0){
+    		DLOG(ERROR)<<strerror(errno);
+    		suceess=false;
+    	}
+    	if(suceess&&system("iptables -t mangle -A DIVERT -j MARK --set-mark 1")<0){
+    		DLOG(ERROR)<<strerror(errno);
+    		suceess=false;
+    	}
+    	if(suceess&&system("iptables -t mangle -A DIVERT -j ACCEPT")<0){
+    		DLOG(ERROR)<<strerror(errno);
+    		suceess=false;
+    	}
+    	if(suceess&&system("ip rule add fwmark 1 lookup 100")<0){
+    		DLOG(ERROR)<<strerror(errno);
+    		suceess=false;
+    	}
+    	if(suceess&&system("ip route add local 0.0.0.0/0 dev lo table 100")<0){
+    		DLOG(ERROR)<<strerror(errno);
+    		suceess=false;
+    	}
+    	if(suceess){
+    		int n=iptables.size();
+        	for(int i=0;i<n;i++){
+        		memset(buffer,0,1500);
+        		sprintf(buffer,rule.c_str(),iptables[i].ToString().c_str());
+        		std::string add=std::string(buffer);
+        		if(system(add.c_str())<0){
+        			DLOG(ERROR)<<strerror(errno);
+        			suceess=false;
+        			break;
+        		}
+        	}
+    	}
+    	if(!suceess){
+    		return -1;
+    	}
+    	DLOG(INFO)<<"configure ip tables";
+    }
+/*
+    {
+    	int status=0;
+    	char buffer[1500]={0};
+    	const char *cmd="iptables -t mangle -N DIVERT&&"\
+    			"iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT &&"\
+				"iptables -t mangle -A DIVERT -j MARK --set-mark 1&&"\
+				"iptables -t mangle -A DIVERT -j ACCEPT&&"\
+				"ip rule add fwmark 1 lookup 100 &&"\
+				"ip route add local 0.0.0.0/0 dev lo table 100&&";
+    	std::string rule=std::string("iptables -t mangle -A PREROUTING -p tcp -d %s  -j TPROXY --tproxy-mark 0x1/0x1 --on-port ")+std::to_string(capture_port);
+    	std::string seperator("&&");
+    	std::string add=std::string(cmd);
+    	int n=iptables.size();
+    	for(int i=0;i<n;i++){
+    		memset(buffer,0,1500);
+    		sprintf(buffer,rule.c_str(),iptables[i].ToString().c_str());
+    		add=add+std::string(buffer);
+    		if(i<n-1){
+    			add=add+seperator;
+    		}
+    	}
+    	FILE *pp = popen(add.c_str(), "w");
+    	if (!pp){
+    		DLOG(ERROR)<<"configure ip tables error";
+    		return -1;
+    	}
+    	pclose(pp);
+    	DLOG(INFO)<<"configure ip tables";
+
+    }
+*/
     octopus_daemonise();
     if(0==octopus_write_pid(pid_pathname.c_str())){
         DLOG(ERROR)<<"write pid failed";
+        octopus_remove_pid(pid_pathname.c_str());
         return -1;
     }
     /*
@@ -212,8 +348,9 @@ int main(int argc, char *argv[]){
     if (rc != 0)
     {
         DLOG(INFO)<<"block sigpipe error";
+        octopus_remove_pid(pid_pathname.c_str());
         return -1;
-    } 
+    }
     std::unique_ptr<OctopusCallerSocketFactory> socket_factory(new OctopusCallerSocketFactory(proxy_saddr_vec));
     TcpServer server(std::move(socket_factory));
     PhysicalSocketServer *socket_server=server.socket_server();
@@ -222,6 +359,7 @@ int main(int argc, char *argv[]){
         int yes=1;
         if(socket_server->SetSocketOption(SOL_IP, IP_TRANSPARENT, &yes, sizeof(yes))){
             DLOG(INFO)<<"set option error";
+            octopus_remove_pid(pid_pathname.c_str());
             return 0;
         }
     }
@@ -230,16 +368,26 @@ int main(int argc, char *argv[]){
     bool success=server.Init(ip_addr,capture_port);
     OctopusService service;
     if(!service.Init(service_ip,service_port)){
-        DLOG(ERROR)<<"start service failed";
+        DLOG(ERROR)<<"init service failed";
+        octopus_remove_pid(pid_pathname.c_str());
     	return -1;
     }
+    /*OctopusArpServer arp_server(ip_set);
+    if(!arp_server.Init(ifname)){
+        DLOG(ERROR)<<"init arp server failed";
+        octopus_remove_pid(pid_pathname.c_str());
+    	return -1;
+    }
+    arp_server.Start();*/
     service.Start();
+    
     if(success){
         while(g_running){
             server.HandleEvent();
         }
     }
     service.Stop();
+    //arp_server.Stop();
     octopus_remove_pid(pid_pathname.c_str());
     return 0;
 }
