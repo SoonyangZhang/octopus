@@ -1,6 +1,6 @@
 /*
 ref: https://github.com/teddyyy/arproxy
-To capture packet, the flag IFF_PROMISC is a must.
+To capture packet in daemon mode, the flag IFF_PROMISC is a must.
 What a lesson.
 2021/04/05  04:54
 */
@@ -18,6 +18,9 @@ What a lesson.
 #include <net/if_arp.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
+#include <set>
+#include <memory.h>
+
 #include "octopus/octopus_base.h"
 #include "base/ip_address.h"
 #include "base/cmdline.h"
@@ -121,7 +124,7 @@ struct in_addr *src_in_addr, struct in_addr *dst_in_addr,int opcodes)
     memcpy(arp_packet->arp_spa, src_in_addr, IPV4_LENGTH);
     memcpy(arp_packet->arp_tpa, dst_in_addr, IPV4_LENGTH);
 }
- void arp_reply(struct sockaddr *saddr_ll,
+ void send_arp_reply(struct sockaddr *saddr_ll,
  const unsigned char *src_mac,const unsigned char *dst_mac,
  struct in_addr *dst, struct in_addr* target, 
  int sock, int opcodes){
@@ -143,7 +146,7 @@ int main(int argc, char **argv){
     octopus_init_signals();
     cmdline::parser a;
     a.add<std::string>("signal", 's', "signal", false, "none");
-    a.add<string>("config", 'c', "config file", false, "oct.conf");
+    a.add<string>("config", 'c', "config file", false, "arp_acl.conf");
     a.add<string>("pidfile", 'p', "pid file", false, "arp_reply.pid");
     a.add<string>("logfile", '\0', "log file", false, "arp_reply.log");
     a.parse_check(argc, argv);
@@ -152,6 +155,8 @@ int main(int argc, char **argv){
     std::string pid_pathname=a.get<string>("pidfile");
     std::string log_pathname=a.get<string>("logfile");
     std::string ifname("eth0");
+    std::set<uint32_t> src_acl;
+    std::set<uint32_t> dst_acl;
     char buffer[ETHER_ARP_PACKET_LEN];
     struct ether_header  *eh=(struct ether_header *)buffer;
     struct ether_arp *arp_packet = (struct ether_arp *)(buffer+ETHER_HEADER_LEN);
@@ -173,7 +178,7 @@ int main(int argc, char **argv){
     }
     ini_t *config=ini_load(conf_pathname.c_str());
     if(!config){
-        DLOG(ERROR)<<"./arp_reply -c oct.conf";
+        DLOG(ERROR)<<"./arp_reply -c arp_acl.conf";
         return -1;
     }
     const char *capture_if_str=ini_get(config,"service","capture_if");
@@ -184,15 +189,72 @@ int main(int argc, char **argv){
         DLOG(ERROR)<<"wrong config in service section";
         return -1;
     }
-    octopus_daemonise();
-    /*if(daemon(0,0)<0){
-        return -1;
-    }*/
-    //std::fstream f_log;
-    //f_log.open(log_pathname.c_str(),std::fstream::out);
+    {
+        bool success=true;
+        const char *section="src-acl";
+        const char *num_str=ini_get(config,section,"num");
+        if(num_str){
+            int n=std::stoi(num_str);
+            for(int i=0;i<n;i++){
+                std::string key="ip"+std::to_string(i+1);
+                const char *ip_str=ini_get(config,section,key.c_str());
+                if(ip_str){
+                    IpAddress ip_addr;
+                    ip_addr.FromString(ip_str);
+                    if(ip_addr.IsIPv4()){
+                        uint32_t ip32=0;
+                        struct in_addr in4=ip_addr.GetIPv4();
+                        memcpy((void*)&ip32,&in4,sizeof(ip32));
+                        src_acl.insert(ip32);
+                    }
+                }else{
+                    success=false;
+                    break;
+                }
+            }
+        }
+        if(!success){
+            DLOG(ERROR)<<"wring acl list";
+            return -1;
+        }
+    }
+
+    {
+        bool success=true;
+        const char *section="dst-acl";
+        const char *num_str=ini_get(config,section,"num");
+        if(num_str){
+            int n=std::stoi(num_str);
+            for(int i=0;i<n;i++){
+                std::string key="ip"+std::to_string(i+1);
+                const char *ip_str=ini_get(config,section,key.c_str());
+                if(ip_str){
+                    IpAddress ip_addr;
+                    ip_addr.FromString(ip_str);
+                    if(ip_addr.IsIPv4()){
+                        uint32_t ip32=0;
+                        struct in_addr in4=ip_addr.GetIPv4();
+                        memcpy((void*)&ip32,&in4,sizeof(ip32));
+                        dst_acl.insert(ip32);
+                    }
+                }else{
+                    success=false;
+                    break;
+                }
+            }
+        }
+        if(!success){
+            DLOG(ERROR)<<"wring acl list";
+            return -1;
+        }
+    }
+    //octopus_daemonise();
+    #if !defined(NDEBUG)
+        std::fstream f_log;
+        f_log.open(log_pathname.c_str(),std::fstream::out);
+    #endif
     if(0==octopus_write_pid(pid_pathname.c_str())){
         DLOG(ERROR)<<"write pid failed";
-        //f_log<<"write pid failed"<<std::endl;
         octopus_remove_pid(pid_pathname.c_str());
         return -1;
     }
@@ -211,7 +273,6 @@ int main(int argc, char **argv){
         DLOG(ERROR)<<strerror(errno);
         close(sock);
         sock=-1;
-        //f_log<<"SIOCGIFINDEX"<<std::endl;
         octopus_remove_pid(pid_pathname.c_str());
         return -1;        
     }
@@ -224,7 +285,6 @@ int main(int argc, char **argv){
         close(sock);
         sock=-1;
         octopus_remove_pid(pid_pathname.c_str());
-        f_log<<"IFF_PROMISC"<<std::endl;
         return -1;
     }
     
@@ -237,7 +297,9 @@ int main(int argc, char **argv){
         DLOG(ERROR)<<strerror(errno);
         close(sock);
         sock=-1;
+        #if !defined(NDEBUG)
         f_log<<"SIOCGIFADDR "<<strerror(errno)<<errno<<std::endl;
+        #endif
         octopus_remove_pid(pid_pathname.c_str());
         return -1;
     }
@@ -246,11 +308,9 @@ int main(int argc, char **argv){
         DLOG(ERROR)<<strerror(errno);
         close(sock);
         sock=-1;
-        //f_log<<"SIOCGIFHWADDR"<<std::endl;
         octopus_remove_pid(pid_pathname.c_str());
         return -1;
     }
-
     memcpy(src_mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
     while(g_running){
         bzero(buffer, ETHER_ARP_PACKET_LEN);
@@ -258,18 +318,38 @@ int main(int argc, char **argv){
         if(r>0&&(ntohs(eh->ether_type)==ETHERTYPE_ARP)&&(ntohs(arp_packet->arp_op)==ARP_REQUEST)){
             eh->ether_type = htons(ETHERTYPE_ARP);
             in_addr src_in_addr=*(struct in_addr *)arp_packet->arp_spa;
-            in_addr targer_in_addr =*(struct in_addr *)arp_packet->arp_tpa;
-            arp_reply((struct sockaddr*)&saddr_ll,
-            src_mac,BROADCAST_ADDR,
-            &src_in_addr,&targer_in_addr,sock,ARPOP_REPLY);
-	    IpAddress src_addr(src_in_addr);
-		IpAddress target_addr(targer_in_addr);
-	    if(f_log.is_open()){
-		f_log<<src_addr.ToString()<<":"<<target_addr.ToString()<<std::endl;
-}
+            in_addr target_in_addr =*(struct in_addr *)arp_packet->arp_tpa;
+            bool responce=false;
+            uint32_t from=0;
+            uint32_t to=0;
+            memcpy(&from,(void*)&src_in_addr,sizeof(from));
+            memcpy(&to,(void*)&target_in_addr,sizeof(to));
+            auto it1=dst_acl.find(to);
+            if(it1!=dst_acl.end()){
+                responce=true;
+            }else{
+                auto it2=src_acl.find(from);
+                if(it2!=src_acl.end()){
+                    responce=true;
+                }
+            }
+            if(responce){
+                send_arp_reply((struct sockaddr*)&saddr_ll,src_mac,BROADCAST_ADDR,
+                                &src_in_addr,&target_in_addr,sock,ARPOP_REPLY);
+                #if !defined(NDEBUG)
+                    IpAddress src_addr(src_in_addr);
+                    IpAddress target_addr(target_in_addr);
+                    if(f_log.is_open()){
+                        f_log<<src_addr.ToString()<<":"<<target_addr.ToString()<<std::endl;
+                    }
+                #endif
+            }
         }
     }
+    #if !defined(NDEBUG)
+        f_log.close();
+    #endif
     close(sock);
-    //f_log.close();
     octopus_remove_pid(pid_pathname.c_str());
+    return 0;
 }

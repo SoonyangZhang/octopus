@@ -11,7 +11,6 @@
 #include "base/ip_address.h"
 #include "logging/logging.h"
 #include "octopus/octopus_base.h"
-//#include "octopus/arp_server.h"
 #include "tcp/tcp_server.h"
 static volatile bool g_running=true;
 static void octopus_signal_handler(int signo, siginfo_t *siginfo, void *ucontext){
@@ -372,13 +371,6 @@ int main(int argc, char *argv[]){
         octopus_remove_pid(pid_pathname.c_str());
     	return -1;
     }
-    /*OctopusArpServer arp_server(ip_set);
-    if(!arp_server.Init(ifname)){
-        DLOG(ERROR)<<"init arp server failed";
-        octopus_remove_pid(pid_pathname.c_str());
-    	return -1;
-    }
-    arp_server.Start();*/
     service.Start();
     
     if(success){
@@ -387,7 +379,6 @@ int main(int argc, char *argv[]){
         }
     }
     service.Stop();
-    //arp_server.Stop();
     octopus_remove_pid(pid_pathname.c_str());
     return 0;
 }
