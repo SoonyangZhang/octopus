@@ -11,6 +11,7 @@
 #include "base/ip_address.h"
 #include "logging/logging.h"
 #include "octopus/octopus_base.h"
+#include "base/pid_file.h"
 #include "tcp/tcp_server.h"
 static volatile bool g_running=true;
 static void octopus_signal_handler(int signo, siginfo_t *siginfo, void *ucontext){
@@ -105,16 +106,6 @@ void OctopusService::Run(){
         tcp_server_->HandleEvent();
     }
 }
-bool CheckIpExist(std::vector<IpAddress> &ip_vec, IpAddress &ele){
-    bool exist=false;
-    for(int i=0;i<ip_vec.size();i++){
-        if(ip_vec[i]==ele){
-            exist=true;
-            break;
-        }
-    }
-    return exist;
-}
 }
 int main(int argc, char *argv[]){
     octopus_init_signals();
@@ -139,13 +130,13 @@ int main(int argc, char *argv[]){
         return -1;
     }
     if(0==action.compare("stop")){
-        int pid=octopus_read_pid(pid_pathname.c_str());
+        int pid=read_pidfile(pid_pathname.c_str());
         if(pid>0){
            octopus_fire_signal(action.c_str(),pid);
         }
         return 0;
     }
-    int pid=octopus_read_pid(pid_pathname.c_str());
+    int pid=read_pidfile(pid_pathname.c_str());
     if(pid){
         DLOG(INFO)<<" oct is already running";
         return 0;
@@ -296,42 +287,10 @@ int main(int argc, char *argv[]){
     	}
     	DLOG(INFO)<<"configure ip tables";
     }
-/*
-    {
-    	int status=0;
-    	char buffer[1500]={0};
-    	const char *cmd="iptables -t mangle -N DIVERT&&"\
-    			"iptables -t mangle -A PREROUTING -p tcp -m socket -j DIVERT &&"\
-				"iptables -t mangle -A DIVERT -j MARK --set-mark 1&&"\
-				"iptables -t mangle -A DIVERT -j ACCEPT&&"\
-				"ip rule add fwmark 1 lookup 100 &&"\
-				"ip route add local 0.0.0.0/0 dev lo table 100&&";
-    	std::string rule=std::string("iptables -t mangle -A PREROUTING -p tcp -d %s  -j TPROXY --tproxy-mark 0x1/0x1 --on-port ")+std::to_string(capture_port);
-    	std::string seperator("&&");
-    	std::string add=std::string(cmd);
-    	int n=iptables.size();
-    	for(int i=0;i<n;i++){
-    		memset(buffer,0,1500);
-    		sprintf(buffer,rule.c_str(),iptables[i].ToString().c_str());
-    		add=add+std::string(buffer);
-    		if(i<n-1){
-    			add=add+seperator;
-    		}
-    	}
-    	FILE *pp = popen(add.c_str(), "w");
-    	if (!pp){
-    		DLOG(ERROR)<<"configure ip tables error";
-    		return -1;
-    	}
-    	pclose(pp);
-    	DLOG(INFO)<<"configure ip tables";
-
-    }
-*/
     octopus_daemonise();
-    if(0==octopus_write_pid(pid_pathname.c_str())){
+    if(0==write_pidfile(pid_pathname.c_str())){
         DLOG(ERROR)<<"write pid failed";
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
         return -1;
     }
     /*
@@ -347,10 +306,11 @@ int main(int argc, char *argv[]){
     if (rc != 0)
     {
         DLOG(INFO)<<"block sigpipe error";
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
         return -1;
     }
-    std::unique_ptr<OctopusCallerSocketFactory> socket_factory(new OctopusCallerSocketFactory(proxy_saddr_vec));
+    std::unique_ptr<OctopusRouteIf> route_if(new OctopusOneRoute(proxy_saddr_vec));
+    std::unique_ptr<OctopusCallerSocketFactory> socket_factory(new OctopusCallerSocketFactory(route_if.get()));
     TcpServer server(std::move(socket_factory));
     PhysicalSocketServer *socket_server=server.socket_server();
     CHECK(socket_server);
@@ -358,7 +318,7 @@ int main(int argc, char *argv[]){
         int yes=1;
         if(socket_server->SetSocketOption(SOL_IP, IP_TRANSPARENT, &yes, sizeof(yes))){
             DLOG(INFO)<<"set option error";
-            octopus_remove_pid(pid_pathname.c_str());
+            remove_pidfile(pid_pathname.c_str());
             return 0;
         }
     }
@@ -368,7 +328,7 @@ int main(int argc, char *argv[]){
     OctopusService service;
     if(!service.Init(service_ip,service_port)){
         DLOG(ERROR)<<"init service failed";
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
     	return -1;
     }
     service.Start();
@@ -379,6 +339,6 @@ int main(int argc, char *argv[]){
         }
     }
     service.Stop();
-    octopus_remove_pid(pid_pathname.c_str());
+    remove_pidfile(pid_pathname.c_str());
     return 0;
 }

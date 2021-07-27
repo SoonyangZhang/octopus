@@ -22,6 +22,7 @@ What a lesson.
 #include <memory.h>
 
 #include "octopus/octopus_base.h"
+#include "base/pid_file.h"
 #include "base/ip_address.h"
 #include "base/cmdline.h"
 #include "base/base_ini.h"
@@ -157,7 +158,7 @@ int main(int argc, char **argv){
     std::string ifname("eth0");
     std::set<uint32_t> src_acl;
     std::set<uint32_t> dst_acl;
-    char buffer[ETHER_ARP_PACKET_LEN];
+    char buffer[1500];
     struct ether_header  *eh=(struct ether_header *)buffer;
     struct ether_arp *arp_packet = (struct ether_arp *)(buffer+ETHER_HEADER_LEN);
     if (geteuid() != 0){
@@ -165,13 +166,13 @@ int main(int argc, char **argv){
         return -1;
     }
     if(0==action.compare("stop")){
-        int pid=octopus_read_pid(pid_pathname.c_str());
+        int pid=read_pidfile(pid_pathname.c_str());
         if(pid>0){
            octopus_fire_signal(action.c_str(),pid);
         }
         return 0;
     }
-    int pid=octopus_read_pid(pid_pathname.c_str());
+    int pid=read_pidfile(pid_pathname.c_str());
     if(pid){
         DLOG(INFO)<<" arp_reply is already running";
         return 0;
@@ -253,9 +254,9 @@ int main(int argc, char **argv){
         std::fstream f_log;
         f_log.open(log_pathname.c_str(),std::fstream::out);
     #endif
-    if(0==octopus_write_pid(pid_pathname.c_str())){
+    if(0==write_pidfile(pid_pathname.c_str())){
         DLOG(ERROR)<<"write pid failed";
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
         return -1;
     }
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -273,7 +274,7 @@ int main(int argc, char **argv){
         DLOG(ERROR)<<strerror(errno);
         close(sock);
         sock=-1;
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
         return -1;        
     }
     saddr_ll.sll_ifindex = ifr.ifr_ifindex;
@@ -284,7 +285,7 @@ int main(int argc, char **argv){
         DLOG(ERROR)<<strerror(errno);
         close(sock);
         sock=-1;
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
         return -1;
     }
     
@@ -300,7 +301,7 @@ int main(int argc, char **argv){
         #if !defined(NDEBUG)
         f_log<<"SIOCGIFADDR "<<strerror(errno)<<errno<<std::endl;
         #endif
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
         return -1;
     }
 */
@@ -308,7 +309,7 @@ int main(int argc, char **argv){
         DLOG(ERROR)<<strerror(errno);
         close(sock);
         sock=-1;
-        octopus_remove_pid(pid_pathname.c_str());
+        remove_pidfile(pid_pathname.c_str());
         return -1;
     }
     memcpy(src_mac, ifr.ifr_hwaddr.sa_data, ETH_ALEN);
@@ -350,6 +351,6 @@ int main(int argc, char **argv){
         f_log.close();
     #endif
     close(sock);
-    octopus_remove_pid(pid_pathname.c_str());
+    remove_pidfile(pid_pathname.c_str());
     return 0;
 }

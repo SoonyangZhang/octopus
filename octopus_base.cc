@@ -9,71 +9,63 @@
 #include <linux/sockios.h>//SIOCOUTQ
 #include <memory.h>
 #include <assert.h>
-#include <sys/file.h>
+#include <algorithm>
 #include "octopus/octopus_base.h"
 #include "tcp/tcp_info.h"
 #include "base/byte_codec.h"
 #include "logging/logging.h"
 namespace basic{
+#define octopus_nonblocking(s)  fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK)
 namespace{
+const int kInitOffset=1;
 const int kBandwithWindowSize=10;
 const int kSegmentSize=1500;
 const int kBufferSize=1500;
-const QuicBandwidth kMinBandwidth=QuicBandwidth::FromKBitsPerSecond(500);
-const QuicTime::Delta kBandwidthInterval=QuicTime::Delta::FromMilliseconds(5);
+const QuicBandwidth   kMinBandwidth=QuicBandwidth::FromKBitsPerSecond(500);
 const QuicTime::Delta kSocketRWInterval=QuicTime::Delta::FromMilliseconds(5);
 const QuicTime::Delta kMinRoundTripTime=QuicTime::Delta::FromMilliseconds(5);
+const QuicTime::Delta kMaxRoundTripTime=QuicTime::Delta::FromMilliseconds(1000);
 }
-static bool OctopusEpollETFlag=false;
-#define octopus_nonblocking(s)  fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK)
-template<typename T>
-T& create_null_ref() { return *static_cast<T*>(nullptr);}
-bool octopus_enable_epollet(){
-OctopusEpollETFlag=true;
-}
-static std::string OctopusHandRoleToString(OctopusHandRole rule) {
+const char * oct_sig_str[]={
+    "sig_min ",
+    "sig_conn_ok ",
+    "sig_conn_failed ",
+    "sig_conn_fin ",
+    "sig_conn_fatal ",
+    "sig_dst_ok ",
+    "sig_dst_failed ",
+};
+static std::string OctRoleStr(uint8_t rule) {
   switch (rule) {
-    case OctopusHandRole::OCTOPUS_HAND_CLIENT:
-      return "octopus_hand_client";
-    case OctopusHandRole::OCTOPUS_HAND_SERVER:
-      return "octopus_hand_server";
+    case OctRole::OCT_HAND_C:
+      return " oct_hand_client ";
+    case OctRole::OCT_HAND_S:
+      return " oct_hand_server ";
+    case OctRole::OCT_DISPA_C:
+      return " oct_dispa_client ";
+    case OctRole::OCT_DISPA_S:
+      return " oct_dispa_server ";
   }
-  return "octopus_hand???";
+  return "oct_role_???";
 }
-static std::string OctopusDispatcherRuleToString(OctopusDispatcherRole rule) {
-  switch (rule) {
-    case OctopusDispatcherRole::OCTOPUS_DISPATCHER_CLIENT:
-      return "octopus_dispatcher_client";
-    case OctopusDispatcherRole::OCTOPUS_DISPATCHER_SERVER:
-      return "octopus_dispatcher_server";
-  }
-  return "octopus_dispatcher???";
-}
-static std::string OctopusSignalCodeToString(OctopusSignalCode code){
-    switch(code){
-        case OCTOPUS_SIG_MIN:
-            return "octopus_sig_min";
-        case OCTOPUS_SIG_CONN_CONNECTING:
-            return "octopus_sig_conn_connecting";
-        case OCTOPUS_SIG_CONN_CONNECTED:
-            return "octopus_sig_conn_connected";
-        case OCTOPUS_SIG_CONN_FAILED:
-            return "octopus_sig_conn_failed";
-        case OCTOPUS_SIG_CONN_DISCONN:
-            return "octopus_sig_conn_disconn";
-        case OCTOPUS_SIG_DST_CONNECTED:
-            return "octopus_sig_dst_connected";
-        case OCTOPUS_SIG_DST_FAILED:
-            return "octopus_sig_dst_failed";
+
+static std::string OctSigCodeStr(OctSigCodeT code){
+    std::string str;
+    int n=sizeof(oct_sig_str)/sizeof(oct_sig_str[0]);
+    for(int i=0;i<n;i++){
+        OctSigCodeT flag=1<<i;
+        if(code&flag){
+           str=str+oct_sig_str[i+1];
+        }
     }
-    return "octopus_sig???";
+    return str;
 }
-int bind_addr(struct sockaddr *addr,bool transparent){
+int bind_addr(struct sockaddr *addr,bool tpproxy){
     int fd=-1;
     int yes=1;
     fd=socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if(fd<0){
-    	DLOG(ERROR)<<strerror(errno);
+        DLOG(ERROR)<<strerror(errno);
         return fd;
     }
     if(setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(int))!=0){
@@ -82,34 +74,51 @@ int bind_addr(struct sockaddr *addr,bool transparent){
         fd=-1;
         return fd;
     }
-    if(transparent&&setsockopt(fd, SOL_IP, IP_TRANSPARENT, &yes, sizeof(int))!=0){
-    	DLOG(ERROR)<<strerror(errno);
+    if(tpproxy&&setsockopt(fd, SOL_IP, IP_TRANSPARENT, &yes, sizeof(int))!=0){
+        DLOG(ERROR)<<strerror(errno);
         close(fd);
         fd=-1;
         return fd;
     }
     if(bind(fd, (struct sockaddr *)addr,sizeof(struct sockaddr_in))<0){
-    	DLOG(ERROR)<<strerror(errno);
+        DLOG(ERROR)<<strerror(errno);
         close(fd);
         fd=-1;
         return fd;
     }
    return fd;
 }
-inline int read_pending(int fd){
-	int pending=-1;
-	if(fd>0){
-		ioctl(fd, SIOCOUTQ, &pending);
-	}
-	return pending;
+//https://lore.kernel.org/patchwork/patch/239843/
+//SIOCOUTQ output queue size (not sent + not acked)
+//SIOCOUTQNSD output queue size (not sent only)
+inline int out_pending(int fd){
+    int pending=-1;
+    if(fd>=0){
+        ioctl(fd,SIOCOUTQNSD, &pending);
+    }
+    return pending;
 }
-
+//SIOCINQ  the number of unread bytes in the receive buffer
+inline int unread_bytes(int fd){
+    int rbuf_byres=-1;
+    if(fd>=0){
+        ioctl(fd,SIOCINQ,&rbuf_byres);
+    }
+    return rbuf_byres;
+}
+inline int budget_align(int budget){
+    int pkts=(budget+kSegmentSize-1)/kSegmentSize;
+    if(1==pkts){
+        pkts+=1;
+    }
+    return pkts*kSegmentSize;
+}
 bool OctopusDispatcherManager::Register(OctopusSessionKey & uuid,OctopusDispatcher*dispatcher){
         bool ret=false;
         auto it=tables_.find(uuid);
         if(it==tables_.end()){
-        	tables_.insert(std::make_pair(uuid,dispatcher));
-        	ret=true;
+            tables_.insert(std::make_pair(uuid,dispatcher));
+            ret=true;
         }
         return ret;
 }
@@ -123,75 +132,78 @@ bool OctopusDispatcherManager::UnRegister(OctopusSessionKey & uuid){
     return ret;
 }
 OctopusDispatcher *OctopusDispatcherManager::Find(OctopusSessionKey &uuid){
-	OctopusDispatcher *dispatcher=nullptr;
-	auto it=tables_.find(uuid);
-	if(it!=tables_.end()){
-		dispatcher=it->second;
-	}
+    OctopusDispatcher *dispatcher=nullptr;
+    auto it=tables_.find(uuid);
+    if(it!=tables_.end()){
+        dispatcher=it->second;
+    }
     return dispatcher;
 }
 
 OctopusBase::OctopusBase(BaseContext *context,int fd):
 context_(context),
-fd_(fd),
-out_bw_filter_(kBandwithWindowSize,QuicBandwidth::Zero(),0){}
-/* the default SO_SNDBUF is 16384 bytes
- * the buffer can be increased dynamically
- * by assuming the rate is 2Mbps
- * when the buffer is fully occupied
- * the time is 16384*8/2=65 ms to drain buffer empty
- */
-int OctopusBase::GetWriteBudget(QuicTime::Delta delta_time) const{
-    int remain=0;
-    if(fd_>0){
-        struct tcp_info_copy info;
-        memset(&info,0,sizeof(info));
-        socklen_t info_size=sizeof(info);
-        uint32_t min_rtt_micro=0;
-        int pending=read_pending(fd_);
-        if(getsockopt(fd_,IPPROTO_TCP,TCP_INFO,(void*)&info,&info_size)==0){
-            min_rtt_micro=info.tcpi_min_rtt;
-            CHECK(min_rtt_micro>0);
+fd_(fd){}
+int OctopusBase::WriteOrBufferData(const char *pv,int sz){
+    int ret=OCT_OK,n=0;
+    const char *data=pv;
+    int remain=sz;
+    if(0==wb_.size()){
+        while(remain>0){
+            n=send(fd_,data,remain,0);
+            if(-1==n){
+                if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
+                    //normal 
+                }else{
+                    //error close
+                    ret=OCT_ERR;
+                }
+                break;
+            }else{
+                if(0==n){
+                    break;
+                }
+                send_bytes_+=n;
+                data+=n;
+                remain-=n;
+            }
         }
-        QuicTime::Delta rtt=QuicTime::Delta::FromMicroseconds(min_rtt_micro);
-        if(rtt<kMinRoundTripTime){
-        	rtt=kMinRoundTripTime;
-        }
-        int budget=0;
-        QuicBandwidth estimate_bw=out_bw_filter_.GetBest();
-        if (estimate_bw<kMinBandwidth){
-            estimate_bw=kMinBandwidth;
-        }
-        budget=estimate_bw.ToBytesPerPeriod(2*rtt);
-        if(budget>pending){
-        	remain=budget-pending;
-        	if(remain<kSegmentSize){
-        		remain=kSegmentSize;
-        	}
-        }
-        //DLOG(INFO)<<delta_time.ToMilliseconds()<<" "<<budget<<" "<<pending<<" "<<remain;
     }
-    return remain;
+    if(remain>0){
+        int old=wb_.size();
+        wb_.resize(old+remain);
+        memcpy(&wb_[old],data,remain);
+    }
+    return ret;
 }
-void OctopusBase::FlushBuffer(){
-    if(fd_<0){
-        CHECK(wb_.size()==0);
-        return ;
-    }
-    int remain=wb_.size();
-    const char *data=wb_.data();
+int OctopusBase::OnFlushBuffer(){
+    int ret=OCT_OK;
     bool flushed=false;
+    int remain=0;
+    const char *data=nullptr;
+    if(fd_<0||0==wb_.size()){
+        return ret;
+    }
+    remain=wb_.size();
+    data=wb_.data();
     while(remain>0){
-        int target=std::min(kSegmentSize,remain);
-        int n=send(fd_,data,target,0);
-        CHECK(n<=target);
-        if(n<=0){
+        int n=send(fd_,data,remain,0);
+        if(-1==n){
+            if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
+                //normal 
+            }else{
+                //error close
+                ret=OCT_ERR;
+            }
             break;
+        }else{
+            if(0==n){
+                break;
+            }
+            send_bytes_+=n;
+            flushed=true;
+            data+=n;
+            remain-=n;
         }
-        send_bytes_+=n;
-        flushed=true;
-        data+=n;
-        remain-=n;
     }
     if(flushed){
         if(remain>0){
@@ -202,51 +214,55 @@ void OctopusBase::FlushBuffer(){
             null_str.swap(wb_);
         }
     }
+    return ret;
 }
 inline void OctopusBase::CloseFd(){
     close(fd_);
     fd_=-1;
 }
-class OutBandwidthAlarmDelegate:public BaseAlarm::Delegate{
+class DeliveredRateAlarmDelegate:public BaseAlarm::Delegate{
 public:
-    OutBandwidthAlarmDelegate(OctopusHand* entity):entity_(entity){}
+    DeliveredRateAlarmDelegate(OctopusHand* entity):entity_(entity){}
     void OnAlarm() override{
-        entity_->OutBandwidthAlarm();
+        entity_->CountDeliveredRateAlarm();
     }
 private:
     OctopusHand *entity_;
 };
-OctopusHand::OctopusHand(BaseContext *context,int fd,OctopusHandRole role,
-        OctopusDispatcherManager &manager,OctopusDispatcher *dispatcher)
-:OctopusBase(context,fd),role_(role),manager_(manager),dispatcher_(dispatcher){
-    if(OCTOPUS_HAND_SERVER==role_){
-        status_=OCTOPUS_CONN_CONNECTED;
-        if(OctopusEpollETFlag){
-            context_->epoll_server()->RegisterFD(fd_,this,EPOLLET|EPOLLIN);
-        }else{
-            context_->epoll_server()->RegisterFD(fd_,this,EPOLLIN);
-        }
+OctopusHand::OctopusHand(BaseContext *context,int fd,OctRole role,
+        OctopusDispatcherManager &manager,OctopusDispatcher *dispatcher):
+OctopusBase(context,fd),
+manager_(manager),
+dispatcher_(dispatcher),
+max_rate_(kBandwithWindowSize,QuicBandwidth::Zero(),0),
+role_(role),
+sp_flag_(0),
+wait_close_(0){
+    if(OCT_HAND_S==role_){
+        context_->epoll_server()->RegisterFD(fd_,this,EPOLLET|EPOLLIN|EPOLLOUT);
+        status_=OCT_CONN_OK;
     }else{
-    	status_=OCTOPUS_CONN_CONNECTING;
+        status_=OCT_CONN_TRYING;
     }
 }
 OctopusHand::~OctopusHand(){
-    if(out_bw_alarm_){
-        out_bw_alarm_->Cancel();
+    if(delivered_bw_alarm_){
+        delivered_bw_alarm_->Cancel();
     }
-    DLOG(INFO)<<this<<Name()<<"dtor "<<send_bytes_<<" "<<recv_bytes_;
+    DLOG(INFO)<<this<<Name()<<" dtor "<<send_bytes_<<" "<<recv_bytes_;
 }
-void OctopusHand::WriteMeta(OctopusSessionKey &uuid,bool sp_flag){
-    if(OCTOPUS_HAND_SERVER==role_){
+void OctopusHand::WriteMeta(OctopusSessionKey &uuid,uint8_t sp_flag){
+    if(OCT_HAND_S==role_){
         return;
     }
-    if(!(msg_flag_&OCTOPUS_META_FLAG)){
+    sp_flag_=sp_flag;
+    if(!(meta_flag_&OCT_META_OK_F)){
         char buffer[kBufferSize];
         DataWriter writer(buffer,kBufferSize);
-        uint8_t type=OCTOPUS_MSG_META;
-        sp_flag_=sp_flag;
+        uint8_t type=OCT_MSG_META;
+        uint8_t flag=sp_flag_;
         bool success=writer.WriteUInt8(type)&&
-                writer.WriteUInt8(sp_flag)&&
+                writer.WriteUInt8(flag)&&
                 writer.WriteUInt32(uuid.from)&&
                 writer.WriteUInt32(uuid.to)&&
                 writer.WriteUInt16(uuid.src_port)&&
@@ -254,248 +270,418 @@ void OctopusHand::WriteMeta(OctopusSessionKey &uuid,bool sp_flag){
         int old=wb_.size();
         wb_.resize(old+writer.length());
         memcpy(&wb_[old],writer.data(),writer.length());
-        msg_flag_|=OCTOPUS_META_FLAG;
+        meta_flag_|=OCT_META_OK_F;
     }
 }
 bool OctopusHand::AsynConnect(const struct sockaddr *addr,socklen_t addrlen){
-    bool ret=false;
     int yes=1;
-    if(OCTOPUS_HAND_SERVER==role_){
-        return ret;
+    if(OCT_HAND_S==role_){
+        return false;
     }
-    //EPOLLOUT for flush meta data
-    if(OctopusEpollETFlag){
-        context_->epoll_server()->RegisterFD(fd_,this,EPOLLET|EPOLLIN|EPOLLOUT);
-    }else{
-        context_->epoll_server()->RegisterFD(fd_,this,EPOLLIN|EPOLLOUT);
-    }
+    context_->epoll_server()->RegisterFD(fd_,this,EPOLLET|EPOLLIN|EPOLLOUT);
     if(connect(fd_,(struct sockaddr *)addr,addrlen) == -1&&errno != EINPROGRESS){
         //connect doesn't work, are we running out of available ports ? if yes, destruct the socket
         if (errno == EAGAIN){
             CloseFd();
             DeleteSelf();
-            return ret;
+            return false;
         }
     }
-    status_=OCTOPUS_CONN_CONNECTING;
+    status_=OCT_CONN_TRYING;
     return true;
 }
-void OctopusHand::SignalFrom(OctopusDispatcher* dispatcher,OctopusSignalCode code){
-    DLOG(INFO)<<this<<Name()<<" "<<OctopusSignalCodeToString(code);
-	if(OCTOPUS_HAND_SERVER==role_){
-        if(OCTOPUS_SIG_DST_FAILED==code||OCTOPUS_SIG_DST_CONNECTED==code){
-            SendMetaAck(code);
-            if(OCTOPUS_SIG_DST_FAILED==code){
-                dispatcher_=nullptr;
-            	ConnClose(code);
+void OctopusHand::SignalFrom(OctopusDispatcher* dispatcher,OctSigCodeT code){
+    if(OCT_HAND_S==role_){
+        if(code&OCT_SIG_DST_OK){
+            DLOG(INFO)<<"send meta dst ok";
+            SendMetaAck(OCT_MSG_DST_OK);
+        }
+        if(code&OCT_SIG_DST_FAILED){
+            DLOG(INFO)<<"send meta dst failure";
+            SendMetaAck(OCT_MSG_DST_FAILED);
+            dispatcher_=nullptr;
+            ConnClose(OCT_SIG_CONN_FIN);
+        }
+        if(code&OCT_SIG_CONN_FATAl){
+            DLOG(INFO)<<"fatal and send fin";
+            dispatcher_=nullptr;
+            ConnClose(OCT_SIG_CONN_FIN);
+        }
+        if(code&OCT_SIG_CONN_FIN){
+            wait_close_=1;
+            DLOG(INFO)<<"wait close 1";
+            dispatcher_=nullptr;
+            if(0==wb_.size()){
+                DLOG(INFO)<<"send fin";
+                ConnClose(OCT_SIG_CONN_FIN);
             }
         }
     }
-    if(OCTOPUS_SIG_CONN_DISCONN==code){
-        dispatcher_=nullptr;
-        wait_close_=true;
-        if(0==wb_.size()){
-            ConnClose(code);
+    
+    if(OCT_HAND_C==role_){
+        if(code&OCT_SIG_CONN_FIN){
+            wait_close_=1;
+            DLOG(INFO)<<"wait close 1";
+            dispatcher_=nullptr;
+            if(0==wb_.size()){
+                DLOG(INFO)<<"send fin";
+                ConnClose(OCT_SIG_CONN_FIN);
+            }
+        }
+        if(code&OCT_SIG_CONN_FATAl||code&OCT_SIG_DST_FAILED){
+            dispatcher_=nullptr;
+            DLOG(INFO)<<"fatal or failure";
+            ConnClose(OCT_SIG_CONN_FIN);
         }
     }
 }
-void OctopusHand::Sink(const char *pv,int sz){
-    if(!out_bw_alarm_){
-        out_bw_alarm_.reset(context_->alarm_factory()->CreateAlarm(new OutBandwidthAlarmDelegate(this)));
+int OctopusHand::Sink(const char *pv,int sz){
+    int ret=OCT_OK;
+    if(!delivered_bw_alarm_){
+        delivered_bw_alarm_.reset(context_->alarm_factory()->CreateAlarm(new DeliveredRateAlarmDelegate(this)));
         QuicTime now=context_->clock()->ApproximateNow();
-        out_bw_alarm_->Update(now,QuicTime::Delta::Zero());
+        delivered_bw_alarm_->Update(now,QuicTime::Delta::Zero());
     }
-    FlushBuffer();
-    const char *data=pv;
-    int remain=sz;
-    if(0==wb_.size()){
-        if(fd_>0){
-            while(remain>0){
-                int target=std::min(remain,kSegmentSize);
-                int n=send(fd_,data,target,0);
-                if(n<=0){
-                    break;
-                }
-                data+=n;
-                send_bytes_+=n;
-                remain-=n;
-            }
-        }
-    }
-    if(remain>0){
-        int old=wb_.size();
-        wb_.resize(old+remain);
-        memcpy(&wb_[old],data,remain);
-    }
+    ret=WriteOrBufferData(pv,sz);
+    return ret;
 }
-void OctopusHand::SinkWithOff(uint64_t offset,const char *pv,int sz){
-//	reserved for multipath
+//format:offset+pv_len+pv
+int OctopusHand::SinkWithOff(uint64_t offset,const char *pv,int sz){
+    int ret=OCT_OK;
+    uint16_t offset_bytes=0,sz_bytes=0;
+    offset_bytes=DataWriter::GetVarInt62Len(offset);
+    sz_bytes=DataWriter::GetVarInt62Len(sz);
+    int hz=offset_bytes+sz_bytes;
+    uint64_t encode_buf[2];
+    DataWriter writer((char*)encode_buf,sizeof(encode_buf));
+    bool success=writer.WriteVarInt62(offset)&&writer.WriteVarInt62(sz);
+    DCHECK(success);
+    DCHECK(writer.length()==hz);
+    ret=Sink(writer.data(),writer.length());
+    DCHECK(OCT_OK==ret);
+    ret=Sink(pv,sz);
+    DLOG(INFO)<<this<<" "<<offset<<" "<<sz;
+    return ret;
 }
 void OctopusHand::OnEvent(int fd, EpollEvent* event){
-    if(OCTOPUS_HAND_SERVER==role_){
-        OnCalleeEvent(fd,event);
-    }else if(OCTOPUS_HAND_CLIENT==role_){
-        OnCallerEvent(fd,event);
+    if(OCT_HAND_S==role_){
+        OnServerEvent(fd,event);
+    }else if(OCT_HAND_C==role_){
+        OnClientEvent(fd,event);
     }
 }
 void OctopusHand::OnShutdown(EpollServer* eps, int fd){
     CloseFd();
+    DLOG(INFO)<<Name()<<" OnShutdown";
     DeleteSelf();
 }
 std::string OctopusHand::Name() const{
-	return OctopusHandRoleToString(role_);
+    return OctRoleStr(role_);
 }
-void OctopusHand::OutBandwidthAlarm(){
+void OctopusHand::CountDeliveredRateAlarm(){
     struct tcp_info_copy info;
     memset(&info,0,sizeof(info));
     socklen_t info_size=sizeof(info);
     uint64_t bytes_acked=0;
-    uint32_t min_rtt_micro=0;
+    uint32_t min_rtt_us=0;
     if(getsockopt(fd_,IPPROTO_TCP,TCP_INFO,(void*)&info,&info_size)==0){
         bytes_acked=info.tcpi_bytes_acked;
-        min_rtt_micro=info.tcpi_min_rtt;
-    }
-    QuicTime::Delta rtt=QuicTime::Delta::FromMicroseconds(min_rtt_micro);
-    QuicTime::Delta update_interval=kBandwidthInterval;
-    if(update_interval<rtt){
-        update_interval=rtt;
-    }
-    QuicTime now=context_->clock()->ApproximateNow();
-    if(last_out_bw_ts_!=QuicTime::Zero()){
-        QuicBandwidth b=QuicBandwidth::Zero();
-        if((bytes_acked>last_out_bytes_acked_)&&(now>last_out_bw_ts_)){
-            b=QuicBandwidth::FromBytesAndTimeDelta(bytes_acked-last_out_bytes_acked_,now-last_out_bw_ts_);
+        min_rtt_us=info.tcpi_min_rtt;
+        if(~0==min_rtt_us){
+            min_rtt_us=kMaxRoundTripTime.ToMicroseconds();
         }
-        out_bw_filter_.Update(b,round_);
+    }
+    QuicTime::Delta rtt=QuicTime::Delta::FromMicroseconds(min_rtt_us);
+    //cap
+    if(rtt<kMinRoundTripTime){
+        rtt=kMinRoundTripTime;
+    }
+    if(rtt>kMaxRoundTripTime){
+        rtt=kMaxRoundTripTime;
+    }
+    QuicTime::Delta new_interval=rtt;
+    QuicTime now=context_->clock()->ApproximateNow();
+    if(QuicTime::Zero()!=check_delivered_ts_){
+        QuicBandwidth b=QuicBandwidth::Zero();
+        if((bytes_acked>pre_bytes_acked_)&&(now>check_delivered_ts_)){
+            b=QuicBandwidth::FromBytesAndTimeDelta(bytes_acked-pre_bytes_acked_,now-check_delivered_ts_);
+        }
+        max_rate_.Update(b,round_);
         round_++;
     }
-    last_out_bw_ts_=now;
-    last_out_bytes_acked_=bytes_acked;
-    out_bw_alarm_->Update(now+update_interval,QuicTime::Delta::Zero());
-    if(wb_.size()>0){
-        FlushBuffer();
-    }
+    check_delivered_ts_=now;
+    pre_bytes_acked_=bytes_acked;
+    delivered_bw_alarm_->Update(now+new_interval,QuicTime::Delta::Zero());
     if(wait_close_&&wb_.size()==0){
-        ConnClose(OCTOPUS_SIG_CONN_DISCONN);
+        DLOG(INFO)<<"send fin";
+        ConnClose(OCT_SIG_CONN_FIN);
     }
+}
+/* the default SO_SNDBUF is 16384 bytes
+ * the buffer can be increased dynamically
+ * by assuming the rate is 2Mbps
+ * when the buffer is fully occupied
+ * the time is 16384*8/2=65 ms to drain buffer empty
+ */
+int OctopusHand::GetWriteBudget()const{
+    int budget=0;
+    if(fd_>0){
+        struct tcp_info_copy info;
+        uint32_t budget_us=0;
+        memset(&info,0,sizeof(info));
+        socklen_t info_sz=sizeof(info);
+        int unsent=out_pending(fd_);
+        if(getsockopt(fd_,IPPROTO_TCP,TCP_INFO,(void*)&info,&info_sz)==0){
+            uint32_t min_rtt_us=info.tcpi_min_rtt;
+            budget_us=min_rtt_us;
+        }
+        if(0==budget_us||~0==budget_us){
+            budget=20*kSegmentSize;
+        }else{
+            QuicBandwidth estimate_bw=max_rate_.GetBest();
+            if (estimate_bw<kMinBandwidth){
+                estimate_bw=kMinBandwidth;
+            }
+            QuicTime::Delta budget_time=QuicTime::Delta::FromMicroseconds(2*budget_us);
+            budget=estimate_bw.ToBytesPerPeriod(budget_time);
+            if(unsent>0){
+                if(budget>=unsent){
+                    budget=budget-unsent;
+                }else{
+                    budget=0;
+                }
+            }
+        }
+    }
+    return budget;
 }
 //client event
-void OctopusHand::OnCallerEvent(int fd, EpollEvent* event){
+void OctopusHand::OnClientEvent(int fd, EpollEvent* event){
     char buffer[kBufferSize];
+    int n=0;
+    bool fin=false;
+    int sc=0;
     if(event->in_events&(EPOLLERR|EPOLLHUP)){
-        if(OCTOPUS_CONN_CONNECTING==status_){
-            ConnClose(OCTOPUS_SIG_CONN_FAILED);
-        }else{
-            ConnClose(OCTOPUS_SIG_CONN_DISCONN);
-        }
-        return;
-    }
-    if(fd_>0&&(event->in_events&EPOLLIN)){
-        if(sp_flag_){
-            while(true){
-                int n=read(fd_,buffer,kBufferSize);
-                if(-1==n){
-                    if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
-                    	break;
-                    }else{
-                        ConnClose(OCTOPUS_SIG_CONN_DISCONN);
-                    }
-                    break;
-                }
-                if(0==n){
-                    ConnClose(OCTOPUS_SIG_CONN_DISCONN);
-                    break;
-                }
-                if(n>0){
-                    recv_bytes_+=n;
-                    if(0==(msg_flag_&OCTOPUS_META_ACK_FLAG)){
-                        msg_flag_|=OCTOPUS_META_ACK_FLAG;
-                        if(OCTOPUS_MSG_DST_CONNECTED==buffer[0]){
-                            if(dispatcher_){
-                                dispatcher_->SignalFrom(this,OCTOPUS_SIG_DST_CONNECTED);
-                                if(n-1>0){
-                                    dispatcher_->Sink(&buffer[1],n-1);
-                                }
-                            }
-                        }
-                        if(OCTOPUS_MSG_DST_FAILED==buffer[0]){
-                            ConnClose(OCTOPUS_SIG_DST_FAILED);
-                            break;
-                        }
-                    }else{
-                        CHECK(dispatcher_);
-                        dispatcher_->Sink(buffer,n);
-                    }
-                }
-            }
-        }else{
-            //TODO multipath,parser offset
+        if(OCT_CONN_TRYING==status_){
+            //clear meta data
+            wb_.clear();
+            ConnClose(OCT_SIG_CONN_FAILED);
+            return ;
+        }else{   
+            sc|=OCT_SIG_CONN_FIN;
+            fin=true;
         }
     }
+    
     if(fd_>0&&(event->in_events&EPOLLOUT)){
-        if (OCTOPUS_CONN_CONNECTING==status_){
-            status_=OCTOPUS_CONN_CONNECTED;
-            if(OctopusEpollETFlag){
-                context_->epoll_server()->ModifyCallback(fd_,EPOLLET|EPOLLIN);
-            }else{
-                context_->epoll_server()->ModifyCallback(fd_,EPOLLIN);
+        if (OCT_CONN_TRYING==status_){
+            status_=OCT_CONN_OK;
+        }
+        if(OCT_CONN_OK==status_){
+            int ret=OnFlushBuffer();
+            if(OCT_OK!=ret){
+                sc|=OCT_SIG_CONN_FIN;
+                fin=true;
             }
         }
-        if(OCTOPUS_CONN_CONNECTED==status_){
-            //flush meta data
-            FlushBuffer();
-        }
     }
-}
-//server event
-void OctopusHand::OnCalleeEvent(int fd, EpollEvent* event){
-    char buffer[kBufferSize];
-    if(event->in_events&(EPOLLERR|EPOLLHUP)){
-    	ConnClose(OCTOPUS_SIG_CONN_DISCONN);
-    }
+    
     if(fd_>0&&(event->in_events&EPOLLIN)){
         while(true){
-            int n=read(fd_,buffer,kBufferSize);
+            n=read(fd_,buffer,kBufferSize);
             if(-1==n){
                 if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
-                    break;
+                    //pass
                 }else{
-                    ConnClose(OCTOPUS_SIG_CONN_DISCONN);
+                    sc|=OCT_SIG_CONN_FIN;
+                    fin=true;
                 }
                 break;
             }
             if(0==n){
-                ConnClose(OCTOPUS_SIG_CONN_DISCONN);
+                sc|=OCT_SIG_CONN_FIN;
+                fin=true;
                 break;
             }
             if(n>0){
                 recv_bytes_+=n;
-                if(0==(msg_flag_&OCTOPUS_META_FLAG)){
-                    int old=rb_.size();
-                    rb_.resize(old+n);
-                    memcpy(&rb_[old],buffer,n);
-                    CalleeParseMeta();
+                if(0==(meta_flag_&OCT_META_ACK_F)){
+                    meta_flag_|=OCT_META_ACK_F;
+                    if(OCT_MSG_DST_OK==buffer[0]){
+                        DLOG(INFO)<<this<<Name()<<" dst connected";
+                        dispatcher_->SignalFrom(this,OCT_SIG_DST_OK);
+                        if(n-1>0){
+                            ProcessInData(&buffer[1],n-1);
+                        }
+                    }
+                    if(OCT_MSG_DST_FAILED==buffer[0]){
+                        DLOG(INFO)<<this<<Name()<<" dst failed";
+                        sc|=OCT_SIG_DST_FAILED;
+                        fin=true;
+                        break;
+                    }
                 }else{
-                    CHECK(rb_.size()==0);
-                    CHECK(dispatcher_!=nullptr);
-                    dispatcher_->Sink(buffer,n);
+                    ProcessInData(buffer,n);
                 }
             }
         }
     }
+    if(fin){
+        //OCT_SIG_DST_FAILED|OCT_SIG_CONN_FIN
+        //OCT_SIG_CONN_FIN
+        //OCT_SIG_DST_FAILED
+        DLOG(INFO)<<Name()<<" "<<OctSigCodeStr(sc);
+        if(sc&OCT_SIG_DST_FAILED){
+            sc=OCT_SIG_DST_FAILED;
+        }else{
+            sc=OCT_SIG_CONN_FIN;
+        }
+        
+        ConnClose(sc);
+    }
 }
-void OctopusHand::ConnClose(OctopusSignalCode code){
+//server event
+void OctopusHand::OnServerEvent(int fd, EpollEvent* event){
+    char buffer[kBufferSize];
+    int n=0;
+    bool fin=false;
+    if(event->in_events&(EPOLLERR|EPOLLHUP)){
+        DLOG(INFO)<<"fin";
+        fin=true;
+    }
+    if(fd_>0&&(event->in_events&EPOLLOUT)){
+        int ret=OnFlushBuffer();
+        if(OCT_OK!=ret){
+            DLOG(INFO)<<"fin";
+            fin=true;
+        }
+    }
+    if(fd_>0&&(event->in_events&EPOLLIN)){
+        while(true){
+            n=read(fd_,buffer,kBufferSize);
+            if(-1==n){
+                if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
+                    //pass
+                }else{
+                    DLOG(INFO)<<"fin";
+                    fin=true;
+                }
+                break;
+            }
+            if(0==n){
+                DLOG(INFO)<<"fin";
+                fin=true;
+                break;
+            }
+            if(n>0){
+                recv_bytes_+=n;
+                if(0==(meta_flag_&OCT_META_OK_F)){
+                    int old=rb_.size();
+                    rb_.resize(old+n);
+                    memcpy(&rb_[old],buffer,n);
+                    ParseMeta();
+                }else{
+                    CHECK(dispatcher_);
+                    ProcessInData(buffer,n);
+                }
+            }
+        }
+    }
+    if(fin){
+        DLOG(INFO)<<"sig fin";
+        ConnClose(OCT_SIG_CONN_FIN);
+    }
+}
+bool OctopusHand::HasCompleteFrame(const char *pv,int sz,uint64_t *offset,uint16_t *offset_bytes,uint64_t *length,uint16_t *length_bytes){
+    bool ret=false;
+    if(sz>0){
+        DataReader reader(pv,sz);
+        uint64_t offset1=0;
+        uint16_t offset_bytes1=0;
+        uint64_t length1=0;
+        uint16_t length_bytes1=0;
+        bool success=reader.ReadVarInt62(&offset1)&&reader.ReadVarInt62(&length1);
+        if(success){
+            offset_bytes1=DataWriter::GetVarInt62Len(offset1);
+            length_bytes1=DataWriter::GetVarInt62Len(length1);
+            int frame_sz=offset_bytes1+length_bytes1+length1;
+            if(sz>=frame_sz){
+                *offset=offset1;
+                *offset_bytes=offset_bytes1;
+                *length=length1;
+                *length_bytes=length_bytes1;
+                ret=true;
+            }
+        }
+    }
+    return ret;
+}
+void OctopusHand::ProcessInData(const char *pv,int sz){
+    if(sz<=0){
+        return;
+    }
+    if(1==sp_flag_){
+        dispatcher_->Sink(pv,sz);
+    }else{
+        int old=rb_.size();
+        rb_.resize(old+sz);
+        memcpy(&rb_[old],pv,sz);
+        const char *buf_ptr=rb_.data();
+        int remain=rb_.size();
+        bool consumed=false;
+        while(remain>0){
+            uint64_t offset=0,length=0;
+            uint16_t offset_bytes=0,length_bytes=0;
+            if(HasCompleteFrame(buf_ptr,remain,&offset,&offset_bytes,&length,&length_bytes)){
+                int hdr_sz=offset_bytes+length_bytes;
+                int frame_sz=hdr_sz+length;
+                const char *data_ptr=buf_ptr+hdr_sz;
+                //DLOG(INFO)<<this<<" off "<<offset<<" "<<frame_sz;
+                if(offset>=kInitOffset){
+                    dispatcher_->SinkWithOff(offset-kInitOffset,data_ptr,length);
+                }else{
+                    OnSignalingData(data_ptr,length);
+                }
+                buf_ptr+=frame_sz;
+                remain-=frame_sz;
+                consumed=true;     
+            }else{
+                //uncomplete
+                break;
+            }
+        }
+        //consumed
+        if(consumed&&remain>0){
+            std::string copy(buf_ptr,remain);
+            copy.swap(rb_);
+        }
+        if(consumed&&0==remain){
+            std::string null_str;
+            null_str.swap(rb_);
+            
+        }
+    }
+}
+void OctopusHand::OnSignalingData(const char *pv,int sz){
+    
+}
+void OctopusHand::ConnClose(OctSigCodeT code){
     if(dispatcher_){
+        if(wb_.size()!=0||rb_.size()!=0){
+            code=OCT_SIG_CONN_FATAl;
+            LOG(ERROR)<<this<<Name()<<" fatal error";
+        }
+        DLOG(INFO)<<Name()<<" "<<OctSigCodeStr(code);
         dispatcher_->SignalFrom(this,code);
         dispatcher_=nullptr;
     }
-    status_=OCTOPUS_CONN_DISCONN;
+    status_=OCT_CONN_CLOSED;
     context_->epoll_server()->UnregisterFD(fd_);
     CloseFd();
     DeleteSelf();
 }
-void OctopusHand::CalleeParseMeta(){
-    if(0==(msg_flag_&OCTOPUS_META_FLAG)){
+void OctopusHand::ParseMeta(){
+    if(0==(meta_flag_&OCT_META_OK_F)){
         DataReader reader(&rb_[0],rb_.size());
         uint8_t type=0;
         uint8_t sp=0;
@@ -507,34 +693,36 @@ void OctopusHand::CalleeParseMeta(){
                 reader.ReadUInt16(&uuid.src_port)&&
                 reader.ReadUInt16(&uuid.dst_port);
         if(success){
-            msg_flag_|=OCTOPUS_META_FLAG;
+            rb_.clear();
+            sockaddr_storage src_saddr;
+            sockaddr_storage dst_saddr;
+            {
+                in_addr  ipv4;
+                memcpy(&ipv4,&uuid.from,sizeof(uuid.from));
+                IpAddress ip_addr(ipv4);
+                SocketAddress socket_addr(ip_addr,uuid.src_port);
+                src_saddr=socket_addr.generic_address();
+                DLOG(INFO)<<this<<Name()<<"origin src "<<socket_addr.ToString();
+            }
+            {
+                in_addr  ipv4;
+                memcpy(&ipv4,&uuid.to,sizeof(uuid.to));
+                IpAddress ip_addr(ipv4);
+                SocketAddress socket_addr(ip_addr,uuid.dst_port);
+                dst_saddr=socket_addr.generic_address();
+                DLOG(INFO)<<this<<Name()<<"origin dst "<<socket_addr.ToString();
+            }
+            meta_flag_|=OCT_META_OK_F;
             sp_flag_=sp;
             CHECK(&manager_!=nullptr);
             OctopusDispatcher *dispatcher=manager_.Find(uuid);
+            //DLOG(INFO)<<"mode "<<(uint32_t)sp_flag_<<" "<<(uintptr_t)dispatcher;
             if(nullptr==dispatcher){
-                sockaddr_storage src_saddr;
-                sockaddr_storage dst_saddr;
-                {
-                	in_addr  ipv4;
-                	memcpy(&ipv4,&uuid.from,sizeof(uuid.from));
-                    IpAddress ip_addr(ipv4);
-                    SocketAddress socket_addr(ip_addr,uuid.src_port);
-                    src_saddr=socket_addr.generic_address();
-                    DLOG(INFO)<<this<<Name()<<"origin src "<<socket_addr.ToString();
-                }
-                {
-                	in_addr  ipv4;
-                	memcpy(&ipv4,&uuid.to,sizeof(uuid.to));
-                    IpAddress ip_addr(ipv4);
-                    SocketAddress socket_addr(ip_addr,uuid.dst_port);
-                    dst_saddr=socket_addr.generic_address();
-                    DLOG(INFO)<<this<<Name()<<"origin dst "<<socket_addr.ToString();
-                }
                 bool positive=false;
                 int sock=bind_addr((sockaddr*)&src_saddr,true);
                 if(sock>0){
-                    dispatcher_=new OctopusDispatcher(context_,sock,uuid,OCTOPUS_DISPATCHER_SERVER,manager_);
-                    if(!sp_flag_){
+                    dispatcher_=new OctopusDispatcher(context_,sock,uuid,OCT_DISPA_S,sp,manager_);
+                    if(0==sp_flag_){
                         manager_.Register(uuid,dispatcher_);
                     }
                     if(dispatcher_->AsynConnect((const struct sockaddr*)&dst_saddr,sizeof(struct sockaddr_in))){
@@ -545,11 +733,10 @@ void OctopusHand::CalleeParseMeta(){
                     DLOG(INFO)<<this<<Name()<<"bind failed";
                 }
                 if(!positive){
-                    SendMetaAck(OCTOPUS_SIG_DST_FAILED);
-                    ConnClose(OCTOPUS_SIG_DST_FAILED);
+                    SendMetaAck(OCT_SIG_DST_FAILED);
+                    ConnClose(OCT_SIG_DST_FAILED);
                 }
                 CHECK(reader.BytesRemaining()==0);
-                rb_.clear();
             }else{
                 dispatcher_=dispatcher;
                 dispatcher_->RegisterHand(this);
@@ -558,20 +745,12 @@ void OctopusHand::CalleeParseMeta(){
         }
     }
 }
-void OctopusHand::SendMetaAck(OctopusSignalCode code){
-    if(fd_>0&&(0==(msg_flag_&OCTOPUS_META_ACK_FLAG))){
-        msg_flag_|=OCTOPUS_META_ACK_FLAG;
-        uint8_t type=0;
-        if(OCTOPUS_SIG_DST_CONNECTED==code){
-            type=OCTOPUS_MSG_DST_CONNECTED;
-        }
-        if(OCTOPUS_SIG_DST_FAILED==code){
-            type=OCTOPUS_MSG_DST_FAILED;
-        }
+void OctopusHand::SendMetaAck(uint8_t type){
+    if(fd_>0&&(0==(meta_flag_&OCT_META_ACK_F))){
+        meta_flag_|=OCT_META_ACK_F;
         CHECK(type!=0);
         send(fd_,(const void*)&type,sizeof(type),0);
         send_bytes_+=1;
-        DLOG(INFO)<<this<<Name()<<OctopusSignalCodeToString(code);
     }
 }
 void OctopusHand::DeleteSelf(){
@@ -584,86 +763,155 @@ void OctopusHand::DeleteSelf(){
     });
 }
 
-class SocketAlarmDelegate:public BaseAlarm::Delegate{
+class ScheduleAlarmDelegate:public BaseAlarm::Delegate{
 public:
-    SocketAlarmDelegate(OctopusDispatcher* entity):entity_(entity){}
+    ScheduleAlarmDelegate(OctopusDispatcher* entity):entity_(entity){}
     void OnAlarm() override{
-        entity_->HandleSocketAlarm();
+        entity_->SocketRWAlarm();
     }
 private:
-	OctopusDispatcher *entity_;
+    OctopusDispatcher *entity_;
 };
 OctopusDispatcher::OctopusDispatcher(BaseContext *context,int fd,OctopusSessionKey &uuid,
-		OctopusDispatcherRole role,OctopusDispatcherManager &manager)
-:OctopusBase(context,fd),uuid_(uuid),role_(role),manager_(manager){
-    if(OCTOPUS_DISPATCHER_CLIENT==role_){
-        //client will not depend on epoll
+		OctRole role,uint8_t sp,OctopusDispatcherManager &manager)
+:OctopusBase(context,fd),uuid_(uuid),manager_(manager),
+w_offset_(kInitOffset),
+role_(role),
+sp_flag_(sp),
+wait_close_(0),
+sequencer_(this){
+    if(OCT_DISPA_C==role_){
         octopus_nonblocking(fd_);
-        status_=OCTOPUS_CONN_CONNECTED;
+        status_=OCT_CONN_OK;
     }else{
-        status_=OCTOPUS_CONN_CONNECTING;
+        status_=OCT_CONN_TRYING;
     }
     context_->RegisterExitVisitor(this);
 }
 OctopusDispatcher::~OctopusDispatcher(){
-	if(socket_alarm_){
-		socket_alarm_->Cancel();
-	}
+    if(rw_alarm_){
+        rw_alarm_->Cancel();
+    }
     DLOG(INFO)<<this<<Name()<<"dtor "<<send_bytes_<<" "<<recv_bytes_;
 }
-void OctopusDispatcher::SignalFrom(OctopusHand*hand,OctopusSignalCode code){
-    DLOG(INFO)<<Name()<<" "<<OctopusSignalCodeToString(code);
-	if(OCTOPUS_DISPATCHER_CLIENT==role_){
-        if(OCTOPUS_SIG_DST_CONNECTED==code){
-            wait_hands_.erase(hand);
-            ready_hands_.insert(hand);
-            if(!socket_alarm_){
-                socket_alarm_.reset(context_->alarm_factory()->CreateAlarm(new SocketAlarmDelegate(this)));
-                QuicTime now=context_->clock()->ApproximateNow();
-                socket_alarm_->Update(now,QuicTime::Delta::Zero());
+void OctopusDispatcher::SignalFrom(OctopusHand*hand,OctSigCodeT code){
+    DLOG(INFO)<<Name()<<" "<<OctSigCodeStr(code);
+    if(code&OCT_SIG_CONN_FATAl){
+        for(auto it=wait_hands_.begin();it!=wait_hands_.end();it++){
+            OctopusHand *ptr=(*it);
+            if(hand!=ptr){
+                (*it)->SignalFrom(this,OCT_SIG_CONN_FATAl);
             }
         }
-    }
-    if(OCTOPUS_SIG_CONN_FAILED==code||OCTOPUS_SIG_CONN_DISCONN==code){
-        wait_hands_.erase(hand);
-        ready_hands_.erase(hand);
-        if(wait_hands_.size()==0&&ready_hands_.size()==0){
-            wait_close_=true;
-            if(wb_.size()==0){
-                ConnClose(OCTOPUS_SIG_CONN_DISCONN);
+        wait_hands_.clear();
+        for(auto it=ready_hands_.begin();it!=ready_hands_.end();it++){
+            OctopusHand *ptr=(*it);
+            if(hand!=ptr){
+                (*it)->SignalFrom(this,OCT_SIG_CONN_FATAl);
             }
+        }
+        ConnClose(OCT_SIG_CONN_FATAl);
+        return ;
+    }
+    if(OCT_DISPA_C==role_){
+        HandleSignalAtClient(hand,code);
+    }
+    if(code&OCT_SIG_CONN_FIN){
+        auto it1=std::find(wait_hands_.begin(),wait_hands_.end(),hand);
+        auto it2=std::find(ready_hands_.begin(),ready_hands_.end(),hand);
+        if(it1!=wait_hands_.end()){
+            wait_hands_.erase(it1);
+        }
+        if(it2!=ready_hands_.end()){
+            ready_hands_.erase(it2);
+        }
+        if(wait_hands_.size()==0&&ready_hands_.size()==0){
+            ConnClose(OCT_SIG_CONN_FIN);
         }
     }
 }
-bool OctopusDispatcher::CreateSingleConnection(const sockaddr_storage &proxy_src_saddr,
+
+//OCT_SIG_DST_OK
+//OCT_SIG_CONN_FATAl OCT_SIG_CONN_FAILED OCT_SIG_DST_FAILED OCT_SIG_CONN_FIN 
+void OctopusDispatcher::HandleSignalAtClient(OctopusHand*hand,OctSigCodeT code){
+    if(code&OCT_SIG_DST_OK){
+        auto it1=std::find(wait_hands_.begin(),wait_hands_.end(),hand);
+        auto it2=std::find(ready_hands_.begin(),ready_hands_.end(),hand);
+        CHECK(it1!=wait_hands_.end());
+        CHECK(it2==ready_hands_.end());
+        wait_hands_.erase(it1);
+        ready_hands_.push_back(hand);
+        if(!rw_alarm_){
+            rw_alarm_.reset(context_->alarm_factory()->CreateAlarm(new ScheduleAlarmDelegate(this)));
+            QuicTime now=context_->clock()->ApproximateNow();
+            rw_alarm_->Update(now,QuicTime::Delta::Zero());
+        }
+    }
+
+    if(code&OCT_SIG_DST_FAILED){
+        CHECK(ready_hands_.size()==0);
+        for(auto it=wait_hands_.begin();it!=wait_hands_.end();it++){
+            OctopusHand *ptr=(*it);
+            if(hand!=ptr){
+                (*it)->SignalFrom(this,OCT_SIG_DST_FAILED);
+            }
+        }
+        wait_hands_.clear();
+        ConnClose(OCT_SIG_DST_FAILED);
+        return ;
+    }
+    
+    if(code&OCT_SIG_CONN_FAILED){
+        auto it1=std::find(wait_hands_.begin(),wait_hands_.end(),hand);
+        CHECK(it1!=wait_hands_.end());
+        wait_hands_.erase(it1);
+        if(wait_hands_.size()==0&&ready_hands_.size()==0){
+            ConnClose(OCT_SIG_CONN_FIN);
+        }
+    }
+}
+//hand will send OCT_SIG_CONN_FIN OCT_SIG_CONN_FATAl
+void OctopusDispatcher::HandleSignalAtServer(OctopusHand*hand,OctSigCodeT code){}
+bool OctopusDispatcher::CreateConnection(const sockaddr_storage &proxy_src_saddr,
                                 const sockaddr_storage &proxy_dst_saddr){
     bool success=false;
     int sock=bind_addr((sockaddr*)&proxy_src_saddr,false);
     if (sock>0){
-        OctopusHand *hand=new OctopusHand(context_,sock,OCTOPUS_HAND_CLIENT,manager_,this);
-        hand->WriteMeta(uuid_,true);
+        OctopusHand *hand=new OctopusHand(context_,sock,OCT_HAND_C,manager_,this);
+        hand->WriteMeta(uuid_,sp_flag_);
         if(hand->AsynConnect((const struct sockaddr*)&proxy_dst_saddr,sizeof(struct sockaddr_in))){
             success=true;
-            wait_hands_.insert(hand);
+            wait_hands_.push_back(hand);
         }
     }
+    return success;
+}
+bool OctopusDispatcher::CreateSingleConnection(const sockaddr_storage &proxy_src_saddr,
+                                const sockaddr_storage &proxy_dst_saddr){
+    bool success=CreateConnection(proxy_src_saddr,proxy_dst_saddr);
     if(!success){
-        ConnClose(OCTOPUS_SIG_CONN_FAILED);
+        ConnClose(OCT_SIG_CONN_FAILED);
     }
     return success;
 }
 bool OctopusDispatcher::CreateMutipleConnections(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>>& proxy_saddrs){
-    return false;
+    int routes=0;
+    for(auto it=proxy_saddrs.begin();it!=proxy_saddrs.end();it++){
+        const sockaddr_storage src=(*it).first;
+        const sockaddr_storage dst=(*it).second;
+        if(true==CreateConnection(src,dst)){
+            routes++;
+        }
+    }
+    if(0==routes){
+        ConnClose(OCT_SIG_CONN_FAILED);
+    }
+    return routes>0;
 }
 bool OctopusDispatcher::AsynConnect(const struct sockaddr *addr,socklen_t addrlen){
     bool ret=false;
     int yes=1;
-    //EPOLLOUT for get connect status
-    if(OctopusEpollETFlag){
-        context_->epoll_server()->RegisterFD(fd_,this,EPOLLET|EPOLLIN|EPOLLOUT);
-    }else{
-        context_->epoll_server()->RegisterFD(fd_,this,EPOLLIN|EPOLLOUT);
-    }
+    context_->epoll_server()->RegisterFD(fd_,this,EPOLLET|EPOLLIN|EPOLLOUT);
     if(connect(fd_,(struct sockaddr *)addr,addrlen) == -1&&errno != EINPROGRESS){
         //connect doesn't work, are we running out of available ports ? if yes, destruct the socket
         if (errno == EAGAIN){
@@ -672,65 +920,68 @@ bool OctopusDispatcher::AsynConnect(const struct sockaddr *addr,socklen_t addrle
             return ret;
         }
     }
-    status_=OCTOPUS_CONN_CONNECTING;
+    status_=OCT_CONN_TRYING;
     return true;
 }
 void OctopusDispatcher::RegisterHand(OctopusHand*hand){
-    if(OCTOPUS_CONN_CONNECTING==status_){
-        wait_hands_.insert(hand);
-    }
-    if(OCTOPUS_CONN_CONNECTED==status_){
-        ready_hands_.insert(hand);
-        hand->SignalFrom(this,OCTOPUS_SIG_DST_CONNECTED);
-    }
-}
-void OctopusDispatcher::Sink(const char *pv,int sz){
-    FlushBuffer();
-    const char *data=pv;
-    int remain=sz;
-    if(0==wb_.size()){
-        if(fd_>0){
-            while(remain>0){
-                int target=std::min(remain,kSegmentSize);
-                int n=send(fd_,data,target,0);
-                if(n<=0){
-                    break;
-                }
-                data+=n;
-                send_bytes_+=n;
-                remain-=n;
-            }
+    if(OCT_CONN_TRYING==status_){
+        auto it=std::find(wait_hands_.begin(),wait_hands_.end(),hand);
+        if(it==wait_hands_.end()){
+            wait_hands_.push_back(hand);
         }
     }
-    if(remain>0){
-        int old=wb_.size();
-        wb_.resize(old+remain);
-        memcpy(&wb_[old],data,remain);
+    if(OCT_CONN_OK==status_){
+        auto it=std::find(ready_hands_.begin(),ready_hands_.end(),hand);
+        if(it==ready_hands_.end()){
+            ready_hands_.push_back(hand);
+        }
+        hand->SignalFrom(this,OCT_SIG_DST_OK);
     }
 }
-void OctopusDispatcher::OnEvent(int fd, EpollEvent* event){
+int OctopusDispatcher::Sink(const char *pv,int sz){
+    int ret=OCT_ERR;
+    if(sz>0){
+        ret=WriteOrBufferData(pv,sz);
+    }
+    return ret;
+}
+int OctopusDispatcher::SinkWithOff(uint64_t offset,const char *pv,int sz){
+    //multipath, store it to sequencer
+    int ret=OCT_OK;
+    int limit=std::numeric_limits<quic::QuicPacketLength>::max();
+    DCHECK(sz<=limit);
+    if(sz>0&&sz<=limit){
+        quic::QuicStreamFrame frame(id(),false,offset,pv,(quic::QuicPacketLength)sz);
+        sequencer_.OnStreamFrame(frame);
+    }else{
+        ret=OCT_ERR;
+    }
+    return ret;
+}
 //only call once
+void OctopusDispatcher::OnEvent(int fd, EpollEvent* event){
     if(event->in_events&(EPOLLERR|EPOLLHUP)){
-        if(OCTOPUS_CONN_CONNECTING==status_){
-        	DLOG(INFO)<<this<<Name()<<" "<<OctopusSignalCodeToString(OCTOPUS_SIG_DST_FAILED);
-            ConnClose(OCTOPUS_SIG_DST_FAILED);
+        if(OCT_CONN_TRYING==status_){
+            DLOG(INFO)<<this<<Name()<<" "<<OctSigCodeStr(OCT_SIG_DST_FAILED);
+            ConnClose(OCT_SIG_DST_FAILED);
+            return;
         }
     }
     if(fd_>0&&(event->in_events&EPOLLOUT)){
-        if(OCTOPUS_CONN_CONNECTING==status_){
-            status_=OCTOPUS_CONN_CONNECTED;
+        if(OCT_CONN_TRYING==status_){
+            status_=OCT_CONN_OK;
             DLOG(INFO)<<this<<Name()<<"connect to origin dst "<<wait_hands_.size();
             for(auto it=wait_hands_.begin();it!=wait_hands_.end();it++){
                 OctopusHand *hand=(*it);
-                hand->SignalFrom(this,OCTOPUS_SIG_DST_CONNECTED);
+                hand->SignalFrom(this,OCT_SIG_DST_OK);
             }
             CHECK(ready_hands_.size()==0);
             ready_hands_.swap(wait_hands_);
             context_->epoll_server()->UnregisterFD(fd_);
-            if(!socket_alarm_){
-                socket_alarm_.reset(context_->alarm_factory()->CreateAlarm(new SocketAlarmDelegate(this)));
+            if(!rw_alarm_){
+                rw_alarm_.reset(context_->alarm_factory()->CreateAlarm(new ScheduleAlarmDelegate(this)));
                 QuicTime now=context_->clock()->ApproximateNow();
-                socket_alarm_->Update(now,QuicTime::Delta::Zero());
+                rw_alarm_->Update(now,QuicTime::Delta::Zero());
             }
         }
     }
@@ -740,59 +991,139 @@ void OctopusDispatcher::OnShutdown(EpollServer* eps, int fd){
     DeleteSelf();
 }
 std::string OctopusDispatcher::Name() const{
-    return OctopusDispatcherRuleToString(role_);
+    return OctRoleStr(role_);
 }
 void OctopusDispatcher::ExitGracefully(){
+    context_->epoll_server()->UnregisterFD(fd_);
     CloseFd();
     DeleteSelf();
 }
-void OctopusDispatcher::HandleSocketAlarm(){
-    char buffer[kBufferSize];
-    if(fd_>0){
-        FlushBuffer();
-        QuicTime now=context_->clock()->ApproximateNow();
-        QuicTime::Delta delta=kSocketRWInterval;
-        if(last_alarm_time_!=QuicTime::Zero()&&now>last_alarm_time_){
-            delta=now-last_alarm_time_;
-        }
-        last_alarm_time_=now;
-        int budget=0;
-        bool closed=false;
+void OctopusDispatcher::OnDataAvailable(){
+    std::string buffer;
+    sequencer_.Read(&buffer);
+    DLOG(INFO)<<this<<" OnDataAvailable "<<buffer.size();
+    Sink(buffer.data(),buffer.size());
+}
+void OctopusDispatcher::OnUnrecoverableError(quic::QuicErrorCode error,const std::string& details){
+    LOG(INFO)<<quic::QuicErrorCodeToString(error)<<" "<<details;
+    CHECK(0);
+}
+void OctopusDispatcher::SocketRWAlarm(){
+    QuicTime now=context_->clock()->ApproximateNow();
+    rw_alarm_ts_=now;
+    OnFlushBuffer();
+    //all hands closed,no need to read
+    if(wait_close_&&wb_.size()==0){
+        LOG(ERROR)<<"unread bytes "<<unread_bytes(fd_);
+        ConnClose(OCT_SIG_CONN_FIN);
+        return;
+    }
+    bool fin=false;
+    if(1==sp_flag_){
         if(ready_hands_.size()>0){
             auto it=ready_hands_.begin();
-            budget=(*it)->GetWriteBudget(delta);
-            while(budget>0){
-                int target=std::min(budget,kBufferSize);
-                int n=read(fd_,buffer,target);
-                if(-1==n){
-                    if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
-                        break;
-                    }else{
-                        closed=true;
-                    }
-                    break;
-                }
-                if(0==n){
-                    closed=true;
-                    break;
-                }
-                if(n>0){
-                    CHECK(n<=target);
-                    recv_bytes_+=n;
-                    budget-=n;
-                    (*it)->Sink(buffer,n);
-                }
+            OctopusHand *hand=(*it);
+            int budget=hand->GetWriteBudget();
+            if(budget>0){
+                fin=ScheduleData(hand,budget,nullptr);
             }
         }
-        if(!closed){
-            socket_alarm_->Update(now+kSocketRWInterval,QuicTime::Delta::Zero());
-        }else{
-            ConnClose(OCTOPUS_SIG_CONN_DISCONN);
-        }
-    
+    }else{
+        fin=MpScheduleData();
+    }
+    if(!fin){
+        rw_alarm_->Update(now+kSocketRWInterval,QuicTime::Delta::Zero());
+    }else{
+        ConnClose(OCT_SIG_CONN_FIN);
     }
 }
-void OctopusDispatcher::ConnClose(OctopusSignalCode code){
+bool OctopusDispatcher::ScheduleData(OctopusHand *hand,int budget,int *read_sz){
+    bool fin=false;
+    if(fd_<0){
+        fin=true;
+        return fin;
+    }
+    int alloc=budget_align(budget);
+    std::unique_ptr<char[]> buffer(new char[alloc]);
+    char *rbuf=buffer.get();
+    int buf_pos=0;
+    //the goal is to call read at least twice
+    //TODO may try unread_bytes
+    int capacity=alloc-kSegmentSize;
+    while(capacity>0){
+        int n=read(fd_,rbuf+buf_pos,capacity);
+        if(-1==n){
+            if(EINTR==errno||EWOULDBLOCK==errno||EAGAIN==errno){
+                //no data available
+            }else{
+                fin=true;
+            }
+            break;
+        }
+        if(0==n){
+            //peer closed
+            fin=true;
+            break;
+        }
+        if(n>0){
+            buf_pos+=n;
+            capacity=alloc-buf_pos;
+        }
+    }
+    if(buf_pos>0){
+        if(read_sz){
+            *read_sz=buf_pos;
+        }
+        recv_bytes_+=buf_pos;
+        if(1==sp_flag_){
+            hand->Sink(rbuf,buf_pos);
+        }else{
+            SendDataWithinLimit(hand,rbuf,buf_pos);
+        }
+    }
+    return fin;
+}
+bool OctopusDispatcher::MpScheduleData(){
+    bool fin=false;
+    if(fd_<0){
+        fin=true;
+        return fin;
+    }
+    int num_path=ready_hands_.size();
+    for(int i=0;i<num_path;i++){
+        int index=schedule_index_%num_path;
+        OctopusHand *hand=ready_hands_[index];
+        int r_sz=0;
+        int budget=hand->GetWriteBudget();
+        if(budget>0){
+            fin=ScheduleData(hand,budget,&r_sz);
+        }
+        //no need to further read data from fd
+        if(!fin&&r_sz<budget){
+            if(r_sz>0){
+                schedule_index_=schedule_index_+1;
+            }
+            break;
+        }
+        if(fin){
+            break;
+        }
+        schedule_index_=schedule_index_+1;
+    }
+    return fin;
+}
+void OctopusDispatcher::SendDataWithinLimit(OctopusHand *hand,const char *pv,int sz){
+    int remain=sz;
+    int limit=std::numeric_limits<quic::QuicPacketLength>::max();
+    while(remain>0){
+        int len=std::min<int>(remain,limit);
+        hand->SinkWithOff(w_offset_,pv,len);
+        pv+=len;
+        w_offset_+=len;
+        remain-=len;
+    }
+}
+void OctopusDispatcher::ConnClose(OctSigCodeT code){
     for(auto it=wait_hands_.begin();it!=wait_hands_.end();it++){
         OctopusHand *hand=(*it);
         hand->SignalFrom(this,code);
@@ -803,10 +1134,9 @@ void OctopusDispatcher::ConnClose(OctopusSignalCode code){
     }
     wait_hands_.clear();
     ready_hands_.clear();
-    CHECK(ready_hands_.size()==0);
-    status_=OCTOPUS_CONN_DISCONN;
+    status_=OCT_CONN_CLOSED;
     if(&manager_!=nullptr){
-    	manager_.UnRegister(uuid_);
+        manager_.UnRegister(uuid_);
     }
     context_->epoll_server()->UnregisterFD(fd_);
     context_->UnRegisterExitVisitor(this);
@@ -823,106 +1153,25 @@ void OctopusDispatcher::DeleteSelf(){
     });
 }
 
-OctopusCallerBackend::OctopusCallerBackend(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec)
-:proxy_saddr_vec_(proxy_saddr_vec){}
+OctopusCallerBackend::OctopusCallerBackend(OctopusRouteIf *route_if)
+:route_if_(route_if){}
 void OctopusCallerBackend::CreateEndpoint(BaseContext *context,int fd){
-    sockaddr_storage origin_src_saddr;
-    sockaddr_storage origin_dst_saddr;
-    OctopusSessionKey uuid;
-    socklen_t addr_len = sizeof(sockaddr_storage);
-    getpeername(fd,(sockaddr*)&origin_src_saddr,&addr_len);
-    getsockname(fd,(sockaddr*)&origin_dst_saddr,&addr_len);
-{
-    SocketAddress socket_addr(origin_src_saddr);
-    IpAddress host=socket_addr.host();
-    in_addr ipv4=host.GetIPv4();
-    memcpy(&uuid.from,&ipv4,sizeof(uuid.from));
-    uuid.src_port=socket_addr.port();
-    DLOG(INFO)<<"origin src "<<socket_addr.ToString();
+	CHECK(route_if_);
+	route_if_->OnAcceptConnection(context,fd);
 }
-{
-    SocketAddress socket_addr(origin_dst_saddr);
-    IpAddress host=socket_addr.host();
-    in_addr ipv4=host.GetIPv4();
-    memcpy(&uuid.to,&ipv4,sizeof(uuid.to));
-    uuid.dst_port=socket_addr.port();
-    DLOG(INFO)<<"origin dst "<<socket_addr.ToString();
-}
-
-    CHECK(proxy_saddr_vec_.size()>0);
-    OctopusDispatcher *dispatcher=new OctopusDispatcher(context,fd,uuid,
-    				OCTOPUS_DISPATCHER_CLIENT,create_null_ref<OctopusDispatcherManager>());
-    dispatcher->CreateSingleConnection(proxy_saddr_vec_[0].first,proxy_saddr_vec_[0].second);
-    UNUSED(dispatcher);
-}
-OctopusCallerSocketFactory::OctopusCallerSocketFactory(const std::vector<std::pair<sockaddr_storage,sockaddr_storage>> &proxy_saddr_vec)
-:proxy_saddr_vec_(proxy_saddr_vec){}
+OctopusCallerSocketFactory::OctopusCallerSocketFactory(OctopusRouteIf *route_if)
+:route_if_(route_if){}
 PhysicalSocketServer* OctopusCallerSocketFactory::CreateSocketServer(BaseContext *context){
-	 std::unique_ptr<OctopusCallerBackend> backend(new OctopusCallerBackend(proxy_saddr_vec_));
+	 std::unique_ptr<OctopusCallerBackend> backend(new OctopusCallerBackend(route_if_));
 	 return new PhysicalSocketServer(context,std::move(backend));
 }
 void OctopusCalleeBackend::CreateEndpoint(BaseContext *context,int fd){
-	OctopusHand *hand=new OctopusHand(context,fd,OCTOPUS_HAND_SERVER,manager_,nullptr);
+	OctopusHand *hand=new OctopusHand(context,fd,OCT_HAND_S,manager_,nullptr);
 	UNUSED(hand);
 }
 PhysicalSocketServer* OctopusCalleeSocketFactory::CreateSocketServer(BaseContext *context){
     std::unique_ptr<OctopusCalleeBackend> backend(new OctopusCalleeBackend());
     return new PhysicalSocketServer(context,std::move(backend));
-}
-int octopus_write_pid (const char *pidfile)
-{
-  FILE *f;
-  int fd;
-  int pid;
-
-  if ( ((fd = open(pidfile, O_RDWR|O_CREAT, 0644)) == -1)
-       || ((f = fdopen(fd, "r+")) == NULL) ) {
-      fprintf(stderr, "Can't open or create %s.\n", pidfile ? pidfile : "(null)");
-      return 0;
-  }
-  
-#ifdef HAVE_FLOCK
-  if (flock(fd, LOCK_EX|LOCK_NB) == -1) {
-      fscanf(f, "%d", &pid);
-      fclose(f);
-      printf("Can't lock, lock is held by pid %d.\n", pid);
-      return 0;
-  }
-#endif
-
-  pid = getpid();
-  if (!fprintf(f,"%d\n", pid)) {
-      printf("Can't write pid , %s.\n", strerror(errno));
-      close(fd);
-      return 0;
-  }
-  fflush(f);
-
-#ifdef HAVE_FLOCK
-  if (flock(fd, LOCK_UN) == -1) {
-      printf("Can't unlock pidfile %s, %s.\n", pidfile, strerror(errno));
-      close(fd);
-      return 0;
-  }
-#endif
-  close(fd);
-
-  return pid;
-}
-int octopus_read_pid(const char *pidfile)
-{
-  FILE *f;
-  int pid;
-
-  if (!(f=fopen(pidfile,"r")))
-    return 0;
-  fscanf(f,"%d", &pid);
-  fclose(f);
-  return pid;
-}
-int octopus_remove_pid(const char *pidfile)
-{
-  return unlink (pidfile);
 }
 void octopus_daemonise(void)
 {
@@ -947,6 +1196,16 @@ void octopus_daemonise(void)
     assert(freopen("/dev/null", "r", stdin));
     assert(freopen("/dev/null", "w", stdout));
     assert(freopen("/dev/null", "w", stderr));
+}
+bool CheckIpExist(std::vector<IpAddress> &ip_vec, IpAddress &ele){
+    bool found=false;
+    for(int i=0;i<ip_vec.size();i++){
+        if(ip_vec[i]==ele){
+            found=true;
+            break;
+        }
+    }
+    return found;
 }
 }
 
